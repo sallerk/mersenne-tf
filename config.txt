@@ -1,0 +1,150 @@
+# ===========================================================================
+#  mersenne_tf0.9 configuration
+#
+#  Everything the program needs is in this file.  Lines starting with # are
+#  comments.  Every value may be written as plain decimal (1234567), with digit
+#  separators (1_234_567), or as a power of two (2^90, 2^90-1).
+#
+#  Values are checked when the file is read.  A number that does not parse, or
+#  one outside the range its key accepts, stops the program with the offending
+#  line number instead of quietly falling back to a default -- so a slipped
+#  keystroke ("50O000") cannot turn into a run you did not ask for.  The
+#  accepted range is listed with each key below.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+#  THE MERSENNE NUMBER.
+#  M_p = 2^p - 1.  p must be PRIME (for composite p the factor form 2kp+1 does
+#  not hold, and 2^p-1 is composite anyway).  M_p is never built in memory, so
+#  p may be as large as you like -- 1277, 82589933, 136279841, ...
+# ---------------------------------------------------------------------------
+exponent   =  9147253
+
+
+# ---------------------------------------------------------------------------
+#  THE FACTOR SEARCH RANGE.
+#  Every prime factor of M_p inside [factor_min, factor_max] will be found.
+#  Upper limit of the arithmetic is 2^127-1.
+#
+#  Examples:   factor_min = 2^70      factor_max = 2^71
+#              factor_min = 3         factor_max = 2^40
+#              factor_min = 1000000   factor_max = 999999999999
+# ---------------------------------------------------------------------------
+factor_min = 1
+factor_max = 2^70
+
+
+# ---------------------------------------------------------------------------
+#  PRE-FACTORING (sieve).
+#  Candidates q = 2kp+1 that are divisible by a prime below this bound are
+#  discarded on the CPU and never reach the GPU, so no GPU time is spent on
+#  numbers that are obviously composite.  Higher = more candidates removed but
+#  more CPU work per candidate; the best value is where the CPU sieve and the
+#  GPU finish at the same rate.
+#
+#  "auto" picks it from the size of the exponent (500000 for exponents up to
+#  32 bits, 1000000 above), which is what the measured optima came out at -- see
+#  README, "Tuning".  The curve is flat: being off by 4x costs under 10%, so
+#  there is little to gain by hand-tuning unless you are benchmarking.
+#  (Sieve primes that fall inside your range are tested directly, so raising
+#   this can never hide a factor.)
+#
+#  Range: auto, or 2 .. 1000000000.
+# ---------------------------------------------------------------------------
+#  Measured optimum for p=9147253 over 2^40..2^65 on this machine: 200000 gives
+#  56.1 s against 57.5 at 100000 and 59.6 at "auto" (500000).  At that depth the
+#  two sides balance -- sieve 52.1 s, GPU 51.9 s -- which is what you want.
+sieve_primes = 200000
+
+
+# ---------------------------------------------------------------------------
+#  CHECKPOINTS.
+#  The run is a loop over bit levels and, inside each, over wheel classes, so a
+#  class boundary is a safe restart point.  A checkpoint is written every
+#  checkpoint_seconds, at every level boundary, and on Ctrl-C (at the last class
+#  that finished -- an interrupted class is re-done, never skipped), and is
+#  deleted when the range completes.  Re-run with the same config to resume; a
+#  checkpoint is only accepted if the exponent and both bounds still match, and
+#  files written before the level-by-level scan order are rejected (they count
+#  classes across the whole range, not within a level).
+#    checkpoint          1 = on, 0 = off  (also true/false, yes/no, on/off)
+#    checkpoint_file     auto = checkpoint_<exponent>.txt
+#    checkpoint_seconds  minimum interval between writes, 0 .. 86400
+# ---------------------------------------------------------------------------
+checkpoint         = 1
+checkpoint_file    = auto
+checkpoint_seconds = 30
+
+
+# ---------------------------------------------------------------------------
+#  ARITHMETIC WIDTH.
+#  auto picks the narrowest kernel that is exact for the bit level being
+#  scanned, and re-picks at every level:
+#     q < 2^70   three 24-bit limbs, lazy reduction   (fastest)
+#     q < 2^72   three 24-bit limbs
+#     q < 2^96   three 32-bit limbs
+#     otherwise  two 64-bit limbs
+#  Narrower is faster because the cost is the accumulation around the multiplies
+#  rather than the multiplies themselves -- sizing the limbs to the candidate
+#  measures 1.46x over the 96-bit path, and skipping the per-squaring reduction
+#  1.78x.  Force 72/96/128 only to compare them; a forced width that cannot hold
+#  the candidates is ignored rather than silently used.
+# ---------------------------------------------------------------------------
+arithmetic = auto
+
+
+# ---------------------------------------------------------------------------
+#  TUNING.  Leave these alone unless you are benchmarking.
+#    segment_size  candidates per sieve segment / GPU batch (power of two).
+#                  2^21..2^23 all measure the same; below that per-batch overhead
+#                  shows up.  Do NOT raise it far: the pinned staging buffers are
+#                  4 bytes per candidate each, so 2^24 needs 64 MB per buffer,
+#                  the pool falls back to its 3-buffer minimum and the pipeline
+#                  starves -- measured 398 M/s against 950 at 2^21..2^23.
+#                  Range 4096 .. 2^28.
+#    threads       CPU sieve threads, 0 = auto (cores - 1).  Range 0 .. 4096.
+#    workgroup     GPU work-group size, 0 = ask the driver.  Measured flat from
+#                  64 to 1024 on an RTX 3070; only 32 was slower.  Range 0 .. 65536.
+#    gpu_slots     batches in flight on the device (2..8).  2 costs ~5%; 3, 4
+#                  and 6 measured within noise of each other.
+#    platform      OpenCL platform index, -1 = auto     (--list-devices)
+#    device        OpenCL device index on that platform, 0 or above
+# ---------------------------------------------------------------------------
+segment_size = 4194304
+threads      = 0
+workgroup    = 0
+gpu_slots    = 3
+platform     = -1
+device       = 0
+
+
+# ---------------------------------------------------------------------------
+#  OUTPUT.
+#    stop_on_factor  1 = stop as soon as a factor is found, 0 = scan it all
+#    results_file    the run log.  One line per factor as it is found, plus one
+#                    end-of-run line for EVERY run -- including a run that found
+#                    nothing, which is the usual outcome and is exactly the fact
+#                    worth keeping ("this range is clean" vs "never searched").
+#                    An interrupted run is recorded as status=interrupted, since
+#                    it only cleared part of the range.
+#
+#                    The search runs one bit level at a time -- below 2^40, then
+#                    2^40..2^50, 2^50..2^60, and every power of two above -- and
+#                    logs a "level=" line the moment each one is cleared, with
+#                    its candidate count and the factors found in it.  That is
+#                    how trial factoring is normally quoted ("cleared to 2^70"),
+#                    so the log compares directly with anyone else's.  A run
+#                    stopped part way keeps every level it did finish; the level
+#                    it was inside is simply absent, never half-claimed.  The
+#                    candidate counts add up to the run line's scanned total.
+#    pause_on_exit   auto   = wait for Enter only when double-clicked (default)
+#                    always = always wait for Enter before closing
+#                    never  = never wait (for scripts / batch jobs)
+#
+#  Factors are printed the instant the GPU finds them, not at the end of the
+#  run, so you can leave a long job going and watch the window.
+# ---------------------------------------------------------------------------
+stop_on_factor = 0
+results_file   = results.txt
+pause_on_exit  = auto

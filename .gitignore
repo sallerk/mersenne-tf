@@ -1,0 +1,20 @@
+# build output
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# run-time output
+results.txt
+checkpoint_*.txt
+
+# local planning notes
+tasks/
+
+# editor / OS cruft
+.vs/
+*.user
+Thumbs.db
+desktop.ini
