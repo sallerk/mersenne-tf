@@ -36,12 +36,12 @@ if errorlevel 1 ( echo ERROR: vcvars64 failed & exit /b 1 )
 rem --- compile ---------------------------------------------------------------
 rem  No CUDA / OpenCL SDK needed: the OpenCL entry points are resolved at run
 rem  time from the driver's OpenCL.dll.
-cl /nologo /O2 /EHsc /std:c++17 /W3 /MT /D_CRT_SECURE_NO_WARNINGS /Fe:mersenne_tf0.9.exe mersenne_tf0.9.cpp
+cl /nologo /O2 /EHsc /std:c++17 /W3 /MT /D_CRT_SECURE_NO_WARNINGS /Fe:mersenne_tf.exe mersenne_tf.cpp
 if errorlevel 1 ( echo. & echo BUILD FAILED & exit /b 1 )
 
 del /q mersenne_tf0*.obj 2>nul
 echo.
-echo Built mersenne_tf0.9.exe
-echo   mersenne_tf0.9.exe --list-devices    show GPUs
-echo   mersenne_tf0.9.exe --selftest        verify against known factorisations
-echo   mersenne_tf0.9.exe                   run the job in config.txt
+echo Built mersenne_tf.exe
+echo   mersenne_tf.exe --list-devices    show GPUs
+echo   mersenne_tf.exe --selftest        verify against known factorisations
+echo   mersenne_tf.exe                   run the job in config.txt
