@@ -77,6 +77,16 @@ arithmetic is competitive with mfakto's Barrett. All of the deficit was the siev
   - Below 2^70 the 24-bit path still wins (7.32 s against 7.87 s) and keeps that band.
   - mfakto has no cliff at 2^72 either — its `cl_barrett32_76/77` kernels match its
     `cl_barrett15_69/70` ones in `--perftest`. This closes the same gap a different way.
+- **`mersenne_tf90Lx2` / `_gs`, three 30-bit limbs, for `q < 2^88`.** The same idea one
+  step further, and the last step there is: the exact worst-case column is 2^62.09 against
+  a 64-bit accumulator, and 31-bit limbs overflow it (2^64.09). **9.38 s → 8.07 s (1.16x)**
+  at 2^84. `auto` uses it for 2^82..2^88.
+  - **2^88..2^96 keeps the 32-bit path**, and that is not an oversight — three limbs cannot
+    reach 2^96 with columns that fit. Four 24-bit limbs would fit comfortably but need 10
+    products for the square and 16 for the reduction, against 15 in total for three limbs:
+    1.7x the multiplies to save an accumulation worth ~21%.
+  - The 28-bit kernel keeps 2^70..2^82, where it is still the faster of the two
+    (8.28 s against 8.69 s at 2^76).
 - **`mersenne_tf72Lx2_gs`**, the sieve fused into trial factoring. A work group compacts one
   chunk of the bitmap into LDS and immediately tests what it found, so the index list never
   reaches global memory and there is no `sieve_compact` launch. It calls the same
@@ -128,6 +138,16 @@ arithmetic is competitive with mfakto's Barrett. All of the deficit was the siev
 
 ### Fixed
 
+- **`phase_total` overflowed 32 bits, and the progress line showed it.** The device
+  accumulates each phase's survivor count in a `uint32`. That is fine at the bit levels
+  this had been tested on and nowhere near it at the wavefront: `2^73..2^74` for
+  `p = 9147253` has **2.1e10 survivors in a single class**, five times the 32-bit range, so
+  the counter wrapped about five times per class. On screen `sieved` sawtoothed between 80%
+  and 100%; less visibly, the same counter feeds the run's reported candidate count, which
+  was therefore wrong by whole multiples of 2^32 at those levels. Now carried as 64 bits in
+  two 32-bit words with an explicit carry (`phase_add`), keeping to core OpenCL 1.2 atomics
+  for the same reason the bitmap does. Present since 1.2; only reachable in practice once
+  the 28/30-bit kernels made those levels worth running.
 - **A failed sieve tier launch was silent.** That loop ignored `clEnqueueNDRangeKernel`'s
   status, so a launch that never ran simply left its primes unsieved — the candidates it
   should have removed went to the GPU instead. Safe, in that it can never hide a factor,
@@ -141,7 +161,7 @@ arithmetic is competitive with mfakto's Barrett. All of the deficit was the siev
 
 ### Verified
 
-- `--selftest` green, now sweeping **five** widths (64/72/84/96/128) rather than four.
+- `--selftest` green, now sweeping **six** widths (64/72/84/90/96/128) rather than four.
   The 84-bit kernel is exercised against M_193's 76-bit factor `61654440233248340616559`,
   which is the only shipped case that lands in its band — without adding 84 to that
   sweep the new kernel would have been covered by nothing at all.

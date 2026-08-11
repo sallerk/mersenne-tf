@@ -186,7 +186,7 @@ The ones worth knowing:
 | `sieve` | `gpu` runs pre-factoring on the device (default); `cpu` is the 1.1 pipeline, kept as the reference — the two produce identical survivor sets |
 | `vector` | candidates per work item: `auto` (2 where available), `1`, `2` |
 | `sieve_primes` | pre-factoring bound. `auto` scales it from the exponent *and* from where the sieve runs — the device path wants a few million, the CPU path much less. On `sieve = cpu` it is capped at `segment_size/8`; the run header says so when the cap bites. Deeper is better on the device up to about 8 M and flat from 2 M to 16 M — that was the other way round before the sieve stopped scaling with the prime count, see `CHANGELOG.md` |
-| `arithmetic` | `auto` picks the narrowest exact kernel per bit level — 24-bit limbs below `2^70`, 28-bit to `2^82`, 32-bit to `2^96`, else 64-bit; force `64`/`72`/`84`/`96`/`128` to compare |
+| `arithmetic` | `auto` picks the narrowest exact kernel per bit level — 24-bit limbs below `2^70`, 28-bit to `2^82`, 30-bit to `2^88`, 32-bit to `2^96`, else 64-bit; force `64`/`72`/`84`/`90`/`96`/`128` to compare |
 | `threads` | CPU sieve threads, `0` = auto (cores − 1) |
 | `platform`, `device` | which GPU (see `--list-devices`), `-1` = auto |
 | `stop_on_factor` | `1` to stop at the first factor instead of scanning the whole range |

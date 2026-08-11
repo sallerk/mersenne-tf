@@ -1328,6 +1328,20 @@ __kernel void sieve_mark_huge(
         atomic_or(&bits[j >> 5], 1u << (j & 31u));
 }
 
+// A 64-bit survivor count carried in two 32-bit words.  OpenCL 1.2 has
+// atomic_add on global uint as core, while 64-bit atomics need
+// cl_khr_int64_base_atomics, which is not universally present -- the same
+// reason the bitmap is uint32.  One word is not enough: a phase at the GIMPS
+// wavefront holds far more than 2^32 survivors (2^73..2^74 at p = 9147253 has
+// 2.1e10 in a single CLASS), and the wrap showed up as the progress line's
+// "sieved" sawtoothing between 80% and 100% -- and, less visibly, as a wrong
+// candidate count in the run's own report.
+inline void phase_add(__global uint *phase_total, uint n)
+{
+    uint old = atomic_add(&phase_total[0], n);
+    if (old + n < old) atomic_inc(&phase_total[1]);   // unsigned wrap = carry
+}
+
 // ---------------------------------------------------------------------------
 //  Bitmap -> index list, plus the count the TF kernel will read.
 //
@@ -1393,7 +1407,7 @@ void sieve_compact(
         gbase = 0u;
         if (total) {
             gbase = atomic_add(count, total);
-            atomic_add(phase_total, total);
+            phase_add(phase_total, total);
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -1486,7 +1500,7 @@ inline uint tfgs_compact(
 
     // The host still wants the survivor count for the progress line; with no
     // sieve_compact to write it, one atomic per group carries it instead.
-    if (lid == 0 && nloc) atomic_add(phase_total, nloc);
+    if (lid == 0 && nloc) phase_add(phase_total, nloc);
     barrier(CLK_LOCAL_MEM_FENCE);
     return nloc;
 }
@@ -1797,6 +1811,271 @@ void mersenne_tf84Lx2_gs(
         uint c0 = chunk_base + (uint)sidx[t];
         uint c1 = have1 ? (chunk_base + (uint)sidx[j1]) : c0;
         tf84L_pair(c0, c1, have1, base_lo, base_hi, step, twop, pexp, pbits,
+                   found_count, found, found_cap);
+    }
+}
+)CLC";
+
+// ===========================================================================
+//  Section G -- three 30-bit limbs, for q < 2^88.
+//
+//  The same trick as section F, pushed to the last limb width where it works.
+//  The peak column for three L-bit limbs is the exact worst case below, and 31
+//  bits overflows a 64-bit accumulator outright:
+//
+//     L    q < 2^B   peak column   headroom
+//     28    2^82       2^58.09      +5.91
+//     29    2^85       2^60.09      +3.91
+//     30    2^88       2^62.09      +1.91
+//     31    2^91       2^64.09      -0.09   overflows
+//
+//  So three limbs cannot reach 2^96, and 2^88..2^96 keeps the 32-bit path.
+//  Going wider would mean four 24-bit limbs, which fits comfortably but needs
+//  10 products for the square and 16 for the reduction against 15 in total
+//  here -- 1.7x the multiplies to save an accumulation worth ~21%, which is a
+//  losing trade.
+//
+//  Montgomery, radix 2^30, R = 2^90, mp = -q^-1 mod 2^30.
+//  VALID ONLY FOR q < 2^88.  The host selects per bit level and never straddles.
+// ===========================================================================
+static const char* TF_KERNEL_SOURCE_G = R"CLC(
+typedef struct { uint x, y, z; } u90;      // three 28-bit limbs, little-endian
+
+#define M30 0x3FFFFFFFu
+
+inline int u90_ge(u90 a, u90 b)
+{
+    if (a.z != b.z) return a.z > b.z;
+    if (a.y != b.y) return a.y > b.y;
+    return a.x >= b.x;
+}
+
+inline int u90_eq(u90 a, u90 b) { return a.x == b.x && a.y == b.y && a.z == b.z; }
+
+inline u90 u90_sub(u90 a, u90 b)            // assumes a >= b
+{
+    uint bx = (a.x < b.x) ? 1u : 0u;
+    uint x  = (a.x - b.x) & M30;
+    uint by = (a.y < b.y + bx) ? 1u : 0u;
+    uint y  = (a.y - b.y - bx) & M30;
+    uint z  = (a.z - b.z - by) & M30;
+    u90 r; r.x = x; r.y = y; r.z = z;
+    return r;
+}
+
+inline uint neg_inv30(uint m0)              // -m^-1 mod 2^30, m odd
+{
+    uint x = m0;
+    for (int i = 0; i < 5; ++i) x = x * (2u - m0 * x);   // inverse mod 2^32
+    return (0u - x) & M30;
+}
+
+// x = 2x mod m, for x < m.
+inline u90 mod_dbl90(u90 a, u90 m)
+{
+    uint z = (a.z << 1) | (a.y >> 29);
+    uint y = ((a.y << 1) | (a.x >> 29)) & M30;
+    uint x = (a.x << 1) & M30;
+    uint over = z >> 30;
+    z &= M30;
+    u90 r; r.x = x; r.y = y; r.z = z;
+    if (over || u90_ge(r, m)) r = u90_sub(r, m);
+    return r;
+}
+
+inline u90 r_mod90(u90 m)                   // 2^84 mod m
+{
+    int b;
+    if      (m.z) b = 60 + (32 - clz(m.z));
+    else if (m.y) b = 30 + (32 - clz(m.y));
+    else          b =      (32 - clz(m.x));
+
+    u90 r;
+    if (b == 90) {                          // 0 - m wraps to 2^84 - m
+        uint bx = (0u < m.x) ? 1u : 0u;
+        uint x  = (0u - m.x) & M30;
+        uint by = (0u < m.y + bx) ? 1u : 0u;
+        uint y  = (0u - m.y - bx) & M30;
+        uint z  = (0u - m.z - by) & M30;
+        r.x = x; r.y = y; r.z = z;
+    } else {
+        u90 p2; p2.x = 0; p2.y = 0; p2.z = 0;
+        if      (b < 30) p2.x = 1u << b;
+        else if (b < 60) p2.y = 1u << (b - 30);
+        else             p2.z = 1u << (b - 60);
+        r = u90_sub(p2, m);
+    }
+    for (int i = b; i < 90; ++i) r = mod_dbl90(r, m);
+    return r;
+}
+
+// Montgomery squaring, radix 2^30.  Columns stay unnormalised in 64-bit
+// accumulators exactly as the 24-bit path does; the peak is ~2^58.3, which is
+// where this kernel's 2^82 ceiling comes from.
+//
+// eager = 1 reduces to [0, m).  eager = 0 leaves it in [0, 2m), which is
+// legitimate only when 4m <= R, i.e. m < 2^82.
+inline u90 mont_sqr90(u90 a, u90 m, uint mp, int eager)
+{
+    ulong X0 = a.x, X1 = a.y, X2 = a.z;
+    ulong M0 = m.x, M1 = m.y, M2 = m.z;
+
+    ulong T0 = X0 * X0;
+    ulong T1 = (X0 * X1) << 1;
+    ulong T2 = ((X0 * X2) << 1) + X1 * X1;
+    ulong T3 = (X1 * X2) << 1;
+    ulong T4 = X2 * X2;
+    ulong T5 = 0;
+
+    for (int i = 0; i < 3; ++i) {
+        uint mu = ((uint)T0 * mp) & M30;
+        T0 += (ulong)mu * M0;                // low 30 bits cancel
+        T1 += (ulong)mu * M1;
+        T2 += (ulong)mu * M2;
+        T1 += (T0 >> 30);                    // the only carry that moves
+        T0 = T1; T1 = T2; T2 = T3; T3 = T4; T4 = T5; T5 = 0;
+    }
+
+    ulong acc = T0;
+    uint r0 = (uint)acc & M30; acc >>= 30;
+    acc += T1;
+    uint r1 = (uint)acc & M30; acc >>= 30;
+    acc += T2;
+    uint r2 = (uint)acc & M30; acc >>= 30;
+
+    u90 r; r.x = r0; r.y = r1; r.z = r2;
+    if (eager) {
+        if ((uint)acc != 0u || u90_ge(r, m)) r = u90_sub(r, m);
+    }
+    return r;
+}
+
+inline u90 q_to_u90(ulong q_lo, ulong q_hi)
+{
+    u90 q;
+    q.x = (uint)(q_lo & M30);
+    q.y = (uint)((q_lo >> 30) & M30);
+    q.z = (uint)(((q_lo >> 60) | (q_hi << 4)) & M30);
+    return q;
+}
+
+// The lazy pair test for q < 2^82.  Same shape as tf72L_pair, one radix wider.
+inline void tf90L_pair(
+    uint c0, uint c1, int have1,
+    const ulong base_lo, const ulong base_hi, const ulong step,
+    const ulong twop, const ulong pexp, const int pbits,
+    __global uint *found_count, __global ulong2 *found, const uint found_cap)
+{
+    ulong q0_lo, q0_hi, q1_lo, q1_hi;
+    build_q(c0, base_lo, base_hi, step, twop, &q0_lo, &q0_hi);
+    build_q(c1, base_lo, base_hi, step, twop, &q1_lo, &q1_hi);
+    u90 q0 = q_to_u90(q0_lo, q0_hi);
+    u90 q1 = q_to_u90(q1_lo, q1_hi);
+
+    // 2q, for the doubling step's single correction
+    u90 q0d, q1d;
+    { uint z = (q0.z << 1) | (q0.y >> 29);
+      uint y = ((q0.y << 1) | (q0.x >> 29)) & M30;
+      uint w = (q0.x << 1) & M30;
+      q0d.x = w; q0d.y = y; q0d.z = z; }
+    { uint z = (q1.z << 1) | (q1.y >> 29);
+      uint y = ((q1.y << 1) | (q1.x >> 29)) & M30;
+      uint w = (q1.x << 1) & M30;
+      q1d.x = w; q1d.y = y; q1d.z = z; }
+
+    uint mp0 = neg_inv30(q0.x), mp1 = neg_inv30(q1.x);
+    u90  one0 = r_mod90(q0),    one1 = r_mod90(q1);
+    u90  x0 = one0,             x1 = one1;
+
+    for (int b = pbits - 1; b >= 0; --b) {
+        x0 = mont_sqr90(x0, q0, mp0, 0);     // stays in [0, 2q)
+        x1 = mont_sqr90(x1, q1, mp1, 0);
+        if ((pexp >> b) & 1UL) {
+            uint z0 = (x0.z << 1) | (x0.y >> 29);
+            uint y0 = ((x0.y << 1) | (x0.x >> 29)) & M30;
+            uint w0 = (x0.x << 1) & M30;
+            x0.x = w0; x0.y = y0; x0.z = z0;
+            if (u90_ge(x0, q0d)) x0 = u90_sub(x0, q0d);
+
+            uint z1 = (x1.z << 1) | (x1.y >> 29);
+            uint y1 = ((x1.y << 1) | (x1.x >> 29)) & M30;
+            uint w1 = (x1.x << 1) & M30;
+            x1.x = w1; x1.y = y1; x1.z = z1;
+            if (u90_ge(x1, q1d)) x1 = u90_sub(x1, q1d);
+        }
+    }
+
+    if (u90_ge(x0, q0)) x0 = u90_sub(x0, q0);       // normalise both sides once
+    if (u90_ge(one0, q0)) one0 = u90_sub(one0, q0);
+    if (u90_ge(x1, q1)) x1 = u90_sub(x1, q1);
+    if (u90_ge(one1, q1)) one1 = u90_sub(one1, q1);
+
+    if (u90_eq(x0, one0)) {
+        uint slot = atomic_inc(found_count);
+        if (slot < found_cap) found[slot] = (ulong2)(q0_lo, q0_hi);
+    }
+    if (have1 && u90_eq(x1, one1)) {
+        uint slot = atomic_inc(found_count);
+        if (slot < found_cap) found[slot] = (ulong2)(q1_lo, q1_hi);
+    }
+}
+
+__kernel void mersenne_tf90Lx2(
+    __global const uint  *idx,
+    __global const uint  *n_buf,
+    const ulong           base_lo,
+    const ulong           base_hi,
+    const ulong           step,
+    const ulong           twop,
+    const ulong           pexp,
+    const int             pbits,
+    __global uint        *found_count,
+    __global ulong2      *found,
+    const uint            found_cap)
+{
+    uint gid = get_global_id(0);
+    uint n = n_buf[0];
+    uint nhalf = (n + 1) >> 1;
+    if (gid >= nhalf) return;
+
+    uint i0 = gid;
+    uint i1 = gid + nhalf;
+    int  have1 = (i1 < n);
+    if (!have1) i1 = i0;                     // harmless duplicate; report is guarded
+
+    tf90L_pair(idx[i0], idx[i1], have1, base_lo, base_hi, step, twop, pexp, pbits,
+               found_count, found, found_cap);
+}
+
+__kernel __attribute__((reqd_work_group_size(TFGS_WG, 1, 1)))
+void mersenne_tf90Lx2_gs(
+    __global const uint  *bits,
+    const uint            len,
+    const ulong           base_lo,
+    const ulong           base_hi,
+    const ulong           step,
+    const ulong           twop,
+    const ulong           pexp,
+    const int             pbits,
+    __global uint        *found_count,
+    __global ulong2      *found,
+    const uint            found_cap,
+    __global uint        *phase_total)
+{
+    __local ushort sidx[TFGS_CHUNK];
+    __local uint   scan[TFGS_WG];
+
+    const uint lid = get_local_id(0), grp = get_group_id(0);
+    const uint nloc = tfgs_compact(bits, len, lid, grp, scan, sidx, phase_total);
+
+    const uint chunk_base = grp * TFGS_CHUNK;
+    const uint nhalf = (nloc + 1u) >> 1;
+    for (uint t = lid; t < nhalf; t += TFGS_WG) {
+        uint j1 = t + nhalf;
+        int  have1 = (j1 < nloc);
+        uint c0 = chunk_base + (uint)sidx[t];
+        uint c1 = have1 ? (chunk_base + (uint)sidx[j1]) : c0;
+        tf90L_pair(c0, c1, have1, base_lo, base_hi, step, twop, pexp, pbits,
                    found_count, found, found_cap);
     }
 }
