@@ -6,25 +6,40 @@ Each release is its own directory; earlier ones are kept as they shipped.
 
 ## 1.3 — 2026-08-11
 
+Two independent things, found in that order.
+
 **The device sieve stopped scaling with the number of primes.** 1.2 moved the sieve to the
 GPU but left it costing one division per (prime, tile) — so its price tracked how many
 primes there were, not how much work they did. Sieving deeper made runs *slower*, which is
 why `sieve_primes` defaulted to a shallow 120000. That is fixed, and the default is now
 twenty times deeper.
 
+**And the arithmetic stopped falling off a cliff at 2^72.** Everything above it used three
+32-bit limbs, whose columns do not fit a 64-bit accumulator and therefore carry and
+normalise at every step — 21%, across the entire band GIMPS trial-factors. Three 28-bit
+limbs reach 2^82 and three 30-bit limbs 2^88 with the same fifteen products and none of
+that. This was invisible for most of the work because every measurement was taken at 2^66,
+where the 24-bit path already applies.
+
 Reference job throughout: `p = 86000009`, `2^66..2^67`, RTX 3070 at its **stock 270 W**
 limit (`sw_power_cap` Not Active, checked before and after), configurations interleaved.
 
-| | inner time |
-|---|---|
-| 1.2 | 9.01 s |
-| **1.3** | **7.59 s** |
-| mfakto 0.15pre8 | 6.93 s |
+| `p = 86000009` | 1.2 | **1.3** | mfakto 0.15pre8 | |
+|---|---|---|---|---|
+| `2^66..2^67` | 9.41 s | **7.99 s** | 7.29 s | 1.18x |
+| `2^76`, same-size slice | 11.65 s | **8.37 s** | — | **1.39x** |
 
-The gap to mfakto goes **1.30x → 1.10x**. On the reference job from 1.2's own README,
-`p = 9147253`: `2^64..2^65` goes 27 s → **17 s**, and `2^40..2^65` 50 s → **32 s**. Measured at *matched* sieve depth it was much
-worse than the headline: at 1.04 M primes 1.2 took 16.78 s against mfakto's 6.91 s (2.43x),
-because 1.2 got slower with depth while mfakto got faster.
+Two bands because 1.3 changes two different things. At `2^66` only the sieve work applies,
+and the gap to mfakto goes **1.29x → 1.10x**. Above `2^70` the new limb widths apply as
+well, and that is the band GIMPS actually trial-factors.
+
+On the reference job from 1.2's own README, `p = 9147253` (entirely below `2^70`, so sieve
+work only), measured in the same window: `2^64..2^65` **21.4 s → 18.6 s**, `2^40..2^65`
+**40.5 s → 34.6 s**.
+
+The sieve deficit was much worse than the headline suggested once depth was matched: at
+1.04 M primes 1.2 took 16.78 s against mfakto's 6.91 s (2.43x), because 1.2 got slower with
+depth while mfakto got faster.
 
 ### The attribution
 
@@ -46,9 +61,15 @@ the time (8.13 → 4.08 → 2.52 → 1.82 s for 32768 → 262144-bit tiles). The
 per-(prime, tile) setup, and at a 32768-bit tile **96% of that tier's primes exceeded the
 tile**, so they struck it 0 or 1 times and the division was almost pure waste.
 
-**The kernels were never the gap.** `--bench` reports 2811 M/s with no sieve at all, and
-mfakto's entire sieve+test pipeline runs at 2515–2721 M/s — the Montgomery 24-bit-limb
-arithmetic is competitive with mfakto's Barrett. All of the deficit was the sieve.
+**At this bit level the kernels were never the gap.** `--bench` reports 2811 M/s with no
+sieve at all, and mfakto's entire sieve+test pipeline runs at 2515–2721 M/s — the Montgomery
+24-bit-limb arithmetic is competitive with mfakto's Barrett, and a later comparison put the
+two TF kernels within a few percent (2861 M/s against 2824–3022). All of the deficit *here*
+was the sieve.
+
+That is a statement about `2^66`, and taking it for a statement about the program was the
+mistake that hid the 2^72 cliff below. At `2^66` the 24-bit kernel applies; above `2^72` it
+did not, and the fallback cost 21%.
 
 ### Added
 
@@ -69,7 +90,7 @@ arithmetic is competitive with mfakto's Barrett. All of the deficit was the siev
   from 2^72 up used to fall back to three 32-bit limbs, whose columns do *not* fit and
   which therefore carry and normalise at every step; that cost **21%** (2850 → 2264 M/s)
   across the whole band GIMPS actually trial-factors. Same fifteen products either way.
-  L = 28 leaves 5.7 bits of headroom (peak ~2^58.3); 29 and 30 also fit but leave 3.7 and
+  L = 28 leaves 5.9 bits of headroom (exact peak 2^58.09); 29 and 30 also fit but leave 3.9 and
   1.7, which is not margin worth three more bits of range for.
   - `auto` now uses it for **2^70 .. 2^82**. A 2^76 slice goes **9.00 s → 7.65 s (1.18x)**;
     the 2^70..2^72 strip goes 8.83 s → 7.81 s, because the eager 24-bit kernel it replaces

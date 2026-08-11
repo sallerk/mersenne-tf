@@ -12,11 +12,21 @@ work can be pasted straight back.
 > Measurements, and the reasoning behind every default, are in
 > [`CHANGELOG.md`](../CHANGELOG.md). This file is the manual.
 
-**New in 1.3** — the device sieve no longer gets more expensive the deeper it goes. In
-1.2 its cost scaled with the *number of primes* rather than with the work they did, so
-sieving deeper made runs slower and `sieve_primes` had to default to a shallow 120000.
-That is fixed and the default is now twenty times deeper, which is most of a **1.19x**
-whole-run gain. Full list, with the measurements, in [`CHANGELOG.md`](../CHANGELOG.md).
+**New in 1.3**, two things.
+
+*The device sieve no longer gets more expensive the deeper it goes.* In 1.2 its cost
+scaled with the **number of primes** rather than with the work they did, so sieving deeper
+made runs slower and `sieve_primes` had to default to a shallow 120000. That is fixed and
+the default is now twenty times deeper.
+
+*The arithmetic no longer falls off a cliff above `2^72`.* Everything past that used three
+32-bit limbs, whose columns do not fit a 64-bit accumulator and so carry and normalise at
+every step — a 21% loss across the whole band GIMPS actually trial-factors. Three 28-bit
+limbs reach `2^82` and three 30-bit limbs `2^88` with the same fifteen products and no
+normalisation at all.
+
+Together: **1.18x** over 1.2 at `2^66`, **1.39x** at `2^76`. Full list, with the
+measurements, in [`CHANGELOG.md`](../CHANGELOG.md).
 
 ---
 
@@ -199,13 +209,14 @@ The ones worth knowing:
 Candidate count scales as **1/p** and **doubles with every bit level**. On an RTX 3070 with
 `p ≈ 9.1M`:
 
-| range | time |
-|---|---|
-| `2^64 .. 2^65` | ~17 s |
-| `2^40 .. 2^65` (everything below, plus that level) | ~32 s |
-| each further bit level | double the one before |
+| range | time | 1.2, same window |
+|---|---|---|
+| `2^64 .. 2^65` | ~19 s | ~21 s |
+| `2^40 .. 2^65` (everything below, plus that level) | ~35 s | ~41 s |
+| each further bit level | double the one before | |
 
-(1.2 was ~27 s and ~50 s for the same two.)
+That job is entirely below `2^70`, so only the sieve work applies to it; a level in the
+`2^72..2^88` band gains the new limb widths as well and is about **1.39x** over 1.2.
 
 So `2^69..2^70` is roughly 32x the `2^64..2^65` level. That is inherent to trial factoring,
 not to this implementation — it is why GIMPS trial-factors to about `2^70`–`2^80` and then

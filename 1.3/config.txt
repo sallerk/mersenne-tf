@@ -83,7 +83,7 @@ worktodo_file = worktodo.txt
 #  sieved or tested, so it moves the same way as the wall time and can be
 #  compared across sieve depths.  (Up to 1.1 it counted GPU arrivals only and
 #  fell as the sieve improved, which made it useless for exactly this job.)
-sieve_primes = 5000000
+sieve_primes = 5500000
 
 
 # ---------------------------------------------------------------------------
