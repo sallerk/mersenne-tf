@@ -1,5 +1,5 @@
 // ===========================================================================
-//  mersenne_tf0.9  --  GPU trial factoring of Mersenne numbers  M_p = 2^p - 1
+//  mersenne_tf 1.2  --  GPU trial factoring of Mersenne numbers  M_p = 2^p - 1
 // ===========================================================================
 //
 //  Finds every PRIME factor of M_p inside a user-chosen range of candidate
@@ -41,8 +41,13 @@
 //  so no prime factor can be lost to the sieve.
 //
 //  Build:  build.bat        (needs only Visual Studio; no CUDA/OpenCL SDK)
-//  Run:    mersenne_tf0.9.exe [--config config.txt] [--selftest] [--list-devices]
+//  Run:    mersenne_tf.exe [--config config.txt] [--selftest] [--list-devices]
 // ===========================================================================
+
+// The one place the release number lives.  Banner, usage text, GIMPS result
+// lines and the run log all derive from these, so they cannot drift apart.
+#define MTF_NAME    "mersenne_tf"
+#define MTF_VERSION "1.2"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -555,17 +560,25 @@ static int g_pause_mode = PAUSE_AUTO;      // read by main() on every exit path
 
 struct Config {
     int         pause_mode    = PAUSE_AUTO;
-    uint64_t    exponent      = 1277;
+    // The job itself lives in worktodo.txt, not here: config.txt is machine
+    // settings, worktodo.txt is what to work on, as GIMPS clients do it.
+    std::string worktodo_file = "worktodo.txt";
+    uint64_t    exponent      = 0;
     U128        factor_min    = u128_from(3);
     U128        factor_max    = u128_shl(u128_from(1), 40);
+    int         bit_lo        = 0;      // as written in worktodo, for reporting
+    int         bit_hi        = 0;
     uint32_t    sieve_primes  = 0;          // 0 = auto (resolve_sieve_limit)
     uint32_t    segment_size  = 1u << 22;
     int         threads       = 0;          // 0 = auto
     int         platform      = -1;         // -1 = auto
     int         device        = 0;
     bool        stop_on_factor = false;
-    std::string results_file  = "results.txt";
+    std::string results_file  = "results.txt";   // GIMPS submission lines only
+    std::string log_file      = "runlog.txt";    // human record of every run
     int         arithmetic    = 0;      // 0 = auto, 96 or 128 to force a kernel
+    int         vector        = 0;      // candidates per work item: 0 = auto, 1 or 2
+    int         sieve_on_gpu  = 1;      // 1 = sieve on the device, 0 = the CPU sieve
     int         workgroup     = 0;      // 0 = ask the driver
     int         gpu_slots     = 3;      // batches in flight on the device
     bool        checkpoint    = true;
@@ -573,19 +586,56 @@ struct Config {
     double      checkpoint_seconds = 30.0;
 };
 
-// sieve_primes = auto.  The best bound is where the CPU sieve and the GPU finish
-// together, so it tracks the GPU's cost per candidate, which is proportional to
-// bitlen(p) (the number of Montgomery squarings).  The two brackets below came
-// from measurement on one machine and are a starting point, not a universal
-// optimum: the balance point moves with the ratio of CPU sieve speed to GPU
-// test speed.  Two brackets are enough because the curve is flat -- being off
-// by 4x costs only a few percent -- so a machine whose optimum differs loses
-// little by leaving this on auto.
+// sieve_primes = auto.  The best bound is where the marginal candidate costs the
+// same to sieve out as to test, so it tracks the cost of testing one candidate,
+// which is proportional to bitlen(p) (the number of Montgomery squarings).
+//
+// The right bound depends on WHERE the sieve runs, and by a lot.  On the CPU it
+// trades host time against device time and the two overlap, so sieving deep is
+// nearly free and the optimum sits high.  On the device both sides compete for
+// the same GPU, nothing is hidden, and the optimum roughly halves.  Measured on
+// one machine over a whole bit level, the device path is flat from about 110000
+// to 130000 and costs ~2% by 200000 and ~8% by 300000 -- so the old shared
+// bracket of 500000 was a real loss once the sieve moved.
+//
+// These are a starting point, not a universal optimum: the balance point moves
+// with the ratio of sieve speed to test speed on the hardware in front of you.
+// The curve is flat enough that a machine whose optimum differs loses little by
+// leaving this on auto.
+//
+// This is the bound the tuning asks for.  What the sieve can actually apply is
+// this limited by sieve_prime_cap_for() below, and the two are reported
+// separately so a bound that cannot take effect is visible rather than silent.
 static uint32_t resolve_sieve_limit(const Config& cfg, uint64_t p)
 {
     if (cfg.sieve_primes) return cfg.sieve_primes;
     int pbits = 0; { uint64_t t = p; while (t) { ++pbits; t >>= 1; } }
-    return (pbits <= 32) ? 500000u : 1000000u;
+    // A wider exponent means more squarings per candidate, so testing one costs
+    // more and it pays to sieve deeper; the second bracket doubles for that.
+    if (cfg.sieve_on_gpu) return (pbits <= 32) ?  120000u :  250000u;
+    return                       (pbits <= 32) ?  500000u : 1000000u;
+}
+
+// The largest prime a segment of `len` candidates will apply.  A prime only
+// earns its keep if the candidates it removes cost the GPU more than the setup
+// costs here; past about len/8 it strikes too few positions to be worth it,
+// which also stops tiny ranges paying for a huge prime table.
+//
+// The sieve loop and the run header both call this, so the bound that is
+// reported cannot drift from the bound that is used.
+static inline uint32_t sieve_prime_cap_for(uint32_t len)
+{
+    return (len > 8192) ? (len / 8) : 1024u;
+}
+
+// What a full-size segment applies: the configured bound, limited by the cap.
+// Short trailing segments cap lower still, so this is an upper bound on the
+// depth actually reached.
+static uint32_t effective_sieve_limit(const Config& cfg, uint64_t p)
+{
+    const uint32_t lim = resolve_sieve_limit(cfg, p);
+    const uint32_t cap = sieve_prime_cap_for(cfg.segment_size);
+    return (lim > cap) ? cap : lim;
 }
 
 static std::string trim(const std::string& s)
@@ -670,6 +720,121 @@ static bool parse_cfg_bool(const std::string& val, bool& out, std::string& err)
     return false;
 }
 
+// ---------------------------------------------------------------------------
+//  worktodo.txt -- what to work on.  Two accepted forms, first entry wins:
+//
+//     Factor=<assignment_id>,<exponent>,<bit_lo>,<bit_hi>
+//         The GIMPS assignment line, as PrimeNet hands it out and as mfaktc
+//         reads it.  Paste an assignment straight in.  The id may be anything
+//         (PrimeNet's 32-hex-digit key, or N/A when you have no assignment).
+//
+//     exponent   = 9147253
+//     factor_min = 1
+//     factor_max = 2^70
+//         The plain form, for a range that is not a whole bit level.
+//
+//  Bit levels are the natural unit here -- the search runs one at a time and
+//  reports each as it clears -- so the Factor= form is preferred.
+// ---------------------------------------------------------------------------
+static bool load_worktodo(const std::string& path, Config& cfg, std::string& err)
+{
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open '" + path + "' -- it holds the job to run"; return false; }
+
+    char line[1024];
+    int  lineno = 0;
+    bool have_exp = false, have_min = false, have_max = false;
+    while (fgets(line, sizeof(line), f)) {
+        ++lineno;
+        std::string s(line);
+        if (lineno == 1 && s.size() >= 3 &&      // UTF-8 BOM, as in load_config
+            (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
+            s = s.substr(3);
+        size_t hash = s.find_first_of("#;");
+        if (hash != std::string::npos) s = s.substr(0, hash);
+        s = trim(s);
+        if (s.empty()) continue;
+
+        std::string lower = s;
+        for (auto& c : lower) c = (char)tolower((unsigned char)c);
+
+        if (lower.rfind("factor=", 0) == 0) {
+            // Factor=<id>,<exponent>,<bit_lo>,<bit_hi>
+            std::vector<std::string> parts;
+            std::string rest = s.substr(7);
+            size_t pos = 0;
+            for (;;) {
+                size_t c = rest.find(',', pos);
+                parts.push_back(trim(rest.substr(pos, c == std::string::npos ? c : c - pos)));
+                if (c == std::string::npos) break;
+                pos = c + 1;
+            }
+            if (parts.size() < 4) {
+                fclose(f);
+                err = path + " line " + std::to_string(lineno) +
+                      ": expected Factor=<id>,<exponent>,<bit_lo>,<bit_hi>";
+                return false;
+            }
+            std::string perr;
+            U128 e;
+            if (!parse_u128(parts[1], e, perr) || e.hi != 0 || e.lo < 2) {
+                fclose(f); err = path + " line " + std::to_string(lineno) + ": bad exponent"; return false;
+            }
+            int lo = atoi(parts[2].c_str()), hi = atoi(parts[3].c_str());
+            if (lo < 0 || hi <= lo || hi > 127) {
+                fclose(f);
+                err = path + " line " + std::to_string(lineno) +
+                      ": bit levels must satisfy 0 <= bit_lo < bit_hi <= 127";
+                return false;
+            }
+            cfg.exponent   = e.lo;
+            cfg.bit_lo     = lo;
+            cfg.bit_hi     = hi;
+            cfg.factor_min = (lo == 0) ? u128_from(1) : u128_shl(u128_from(1), (unsigned)lo);
+            cfg.factor_max = u128_shl(u128_from(1), (unsigned)hi);
+            fclose(f);
+            return true;
+        }
+
+        size_t eq = s.find('=');
+        if (eq == std::string::npos) {
+            fclose(f);
+            err = path + " line " + std::to_string(lineno) + ": expected 'key = value' or 'Factor=...'";
+            return false;
+        }
+        std::string key = trim(lower.substr(0, eq)), val = trim(s.substr(eq + 1));
+        std::string perr;
+        if (key == "exponent" || key == "p") {
+            U128 v;
+            if (!parse_u128(val, v, perr) || v.hi != 0 || v.lo < 2) {
+                fclose(f); err = path + " line " + std::to_string(lineno) + ": bad exponent"; return false;
+            }
+            cfg.exponent = v.lo; have_exp = true;
+        } else if (key == "factor_min" || key == "min") {
+            if (!parse_u128(val, cfg.factor_min, perr)) {
+                fclose(f); err = path + " line " + std::to_string(lineno) + ": " + perr; return false;
+            }
+            have_min = true;
+        } else if (key == "factor_max" || key == "max") {
+            if (!parse_u128(val, cfg.factor_max, perr)) {
+                fclose(f); err = path + " line " + std::to_string(lineno) + ": " + perr; return false;
+            }
+            have_max = true;
+        } else {
+            fclose(f);
+            err = path + " line " + std::to_string(lineno) + ": unknown key '" + key +
+                  "' (worktodo holds the job; machine settings go in config.txt)";
+            return false;
+        }
+    }
+    fclose(f);
+    if (!have_exp || !have_min || !have_max) {
+        err = path + ": needs either a Factor= line or all of exponent/factor_min/factor_max";
+        return false;
+    }
+    return true;
+}
+
 static bool load_config(const std::string& path, Config& cfg, std::string& err)
 {
     FILE* f = fopen(path.c_str(), "rb");
@@ -687,6 +852,12 @@ static bool load_config(const std::string& path, Config& cfg, std::string& err)
     while (fgets(line, sizeof(line), f)) {
         ++lineno;
         std::string s(line);
+        // Editors that save "UTF-8 with BOM" put three bytes in front of the
+        // first line; without this the file reads as a syntax error on line 1
+        // and nothing in the message hints at an invisible character.
+        if (lineno == 1 && s.size() >= 3 &&
+            (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
+            s = s.substr(3);
         size_t hash = s.find('#');
         if (hash != std::string::npos) s = s.substr(0, hash);
         s = trim(s);
@@ -699,15 +870,13 @@ static bool load_config(const std::string& path, Config& cfg, std::string& err)
         if (val.empty()) return fail(key + ": no value");
 
         std::string perr;
-        if (key == "exponent" || key == "p" || key == "mp") {
-            U128 v;
-            if (!parse_u128(val, v, perr)) return fail("bad exponent (" + perr + ")");
-            if (v.hi != 0)                 return fail("bad exponent (must fit in 64 bits)");
-            cfg.exponent = v.lo;
-        } else if (key == "factor_min" || key == "lower" || key == "min") {
-            if (!parse_u128(val, cfg.factor_min, perr)) return fail(key + ": " + perr);
-        } else if (key == "factor_max" || key == "upper" || key == "max") {
-            if (!parse_u128(val, cfg.factor_max, perr)) return fail(key + ": " + perr);
+        if (key == "exponent" || key == "p" || key == "mp" ||
+            key == "factor_min" || key == "lower" || key == "min" ||
+            key == "factor_max" || key == "upper" || key == "max") {
+            return fail("'" + key + "' has moved to worktodo.txt (see that file for the\n"
+                        "        format).  config.txt is machine settings only.");
+        } else if (key == "worktodo_file") {
+            cfg.worktodo_file = val;
         } else if (key == "sieve_primes") {
             if (val == "auto") cfg.sieve_primes = 0u;
             else if (!parse_cfg_uint(val, 2, 1000000000u, cfg.sieve_primes, perr)) return fail(key + ": " + perr);
@@ -723,6 +892,8 @@ static bool load_config(const std::string& path, Config& cfg, std::string& err)
             if (!parse_cfg_bool(val, cfg.stop_on_factor, perr)) return fail(key + ": " + perr);
         } else if (key == "results_file") {
             cfg.results_file = val;
+        } else if (key == "log_file") {
+            cfg.log_file = val;
         } else if (key == "workgroup") {
             if (!parse_cfg_int(val, 0, 65536, cfg.workgroup, perr)) return fail(key + ": " + perr);
         } else if (key == "gpu_slots") {
@@ -734,6 +905,15 @@ static bool load_config(const std::string& path, Config& cfg, std::string& err)
             else if (val == "96")   cfg.arithmetic = 96;
             else if (val == "128")  cfg.arithmetic = 128;
             else return fail("arithmetic must be auto/64/72/96/128");
+        } else if (key == "vector") {
+            if      (val == "auto") cfg.vector = 0;
+            else if (val == "1")    cfg.vector = 1;
+            else if (val == "2")    cfg.vector = 2;
+            else return fail("vector must be auto/1/2");
+        } else if (key == "sieve") {
+            if      (val == "gpu") cfg.sieve_on_gpu = 1;
+            else if (val == "cpu") cfg.sieve_on_gpu = 0;
+            else return fail("sieve must be gpu/cpu");
         } else if (key == "checkpoint") {
             if (!parse_cfg_bool(val, cfg.checkpoint, perr)) return fail(key + ": " + perr);
         } else if (key == "checkpoint_file") {
@@ -771,6 +951,13 @@ struct Gpu {
     cl_kernel        kernel64 = nullptr;   // 64-bit path (two 32-bit limbs), q < 2^64
     cl_kernel        kernel72 = nullptr;   // 72-bit path (24-bit limbs), q < 2^72
     cl_kernel        kernel72L = nullptr;  // as above, lazy reduction, q < 2^70
+    cl_kernel        kernel72Lx2 = nullptr;// as above, two candidates per work item
+    // the device-side sieve
+    cl_kernel        k_offsets   = nullptr;
+    cl_kernel        k_tier      = nullptr;   // primes < 64, register accumulate
+    cl_kernel        k_oct       = nullptr;   // octave windows, LDS staged
+    cl_kernel        k_large     = nullptr;
+    cl_kernel        k_compact   = nullptr;
     std::string      name;
     size_t           wg_size  = 64;
     size_t           wg96     = 64;
@@ -778,6 +965,7 @@ struct Gpu {
     size_t           wg64     = 64;
     size_t           wg72     = 64;
     size_t           wg72L    = 64;
+    size_t           wg72Lx2  = 64;
     cl_uint          cus      = 0;
 };
 
@@ -877,9 +1065,9 @@ static bool gpu_init(Gpu& g, int want_platform, int want_device, std::string& er
     }
     if (!g.xfer || st != CL_SUCCESS) { err = "clCreateCommandQueue(transfer) failed"; return false; }
 
-    const char* srcs[3] = { TF_KERNEL_SOURCE_A, TF_KERNEL_SOURCE_B, TF_KERNEL_SOURCE_C };
-    size_t      lens[3] = { strlen(srcs[0]), strlen(srcs[1]), strlen(srcs[2]) };
-    g.program = CL.CreateProgramWithSource(g.ctx, 3, srcs, lens, &st);
+    const char* srcs[4] = { TF_KERNEL_SOURCE_A, TF_KERNEL_SOURCE_B, TF_KERNEL_SOURCE_C, TF_KERNEL_SOURCE_D };
+    size_t      lens[4] = { strlen(srcs[0]), strlen(srcs[1]), strlen(srcs[2]), strlen(srcs[3]) };
+    g.program = CL.CreateProgramWithSource(g.ctx, 4, srcs, lens, &st);
     if (!g.program || st != CL_SUCCESS) { err = "clCreateProgramWithSource failed"; return false; }
 
     st = CL.BuildProgram(g.program, 1, &g.device, "-cl-std=CL1.2", nullptr, nullptr);
@@ -903,6 +1091,17 @@ static bool gpu_init(Gpu& g, int want_platform, int want_device, std::string& er
     if (!g.kernel72 || st != CL_SUCCESS) { err = "clCreateKernel(mersenne_tf72) failed"; return false; }
     g.kernel72L = CL.CreateKernel(g.program, "mersenne_tf72L", &st);
     if (!g.kernel72L || st != CL_SUCCESS) { err = "clCreateKernel(mersenne_tf72L) failed"; return false; }
+    g.kernel72Lx2 = CL.CreateKernel(g.program, "mersenne_tf72Lx2", &st);
+    if (!g.kernel72Lx2 || st != CL_SUCCESS) { err = "clCreateKernel(mersenne_tf72Lx2) failed"; return false; }
+    struct { cl_kernel* k; const char* nm; } sieve_k[] = {
+        { &g.k_offsets, "sieve_offsets" },
+        { &g.k_tier, "sieve_mark_small" }, { &g.k_oct, "sieve_mark_tier" }, { &g.k_large, "sieve_mark_large" },
+        { &g.k_compact, "sieve_compact" },
+    };
+    for (auto& e : sieve_k) {
+        *e.k = CL.CreateKernel(g.program, e.nm, &st);
+        if (!*e.k || st != CL_SUCCESS) { err = std::string("clCreateKernel(") + e.nm + ") failed"; return false; }
+    }
 
     size_t maxwg = 64;
     CL.GetKernelWorkGroupInfo(g.kernel, g.device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(maxwg), &maxwg, nullptr);
@@ -922,6 +1121,8 @@ static bool gpu_init(Gpu& g, int want_platform, int want_device, std::string& er
     maxwg = 64;
     CL.GetKernelWorkGroupInfo(g.kernel72L, g.device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(maxwg), &maxwg, nullptr);
     g.wg72L = (maxwg >= 256) ? 256 : (maxwg ? maxwg : 64);
+    CL.GetKernelWorkGroupInfo(g.kernel72Lx2, g.device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(maxwg), &maxwg, nullptr);
+    g.wg72Lx2 = (maxwg >= 256) ? 256 : (maxwg ? maxwg : 64);
     return true;
 }
 
@@ -929,6 +1130,12 @@ static void gpu_free(Gpu& g)
 {
     if (g.kernel64) CL.ReleaseKernel(g.kernel64);
     if (g.kernel72L) CL.ReleaseKernel(g.kernel72L);
+    if (g.kernel72Lx2) CL.ReleaseKernel(g.kernel72Lx2);
+    if (g.k_offsets) CL.ReleaseKernel(g.k_offsets);
+    if (g.k_tier)    CL.ReleaseKernel(g.k_tier);
+    if (g.k_oct)     CL.ReleaseKernel(g.k_oct);
+    if (g.k_large)   CL.ReleaseKernel(g.k_large);
+    if (g.k_compact) CL.ReleaseKernel(g.k_compact);
     if (g.kernel72)  CL.ReleaseKernel(g.kernel72);
     if (g.kernel96x2) CL.ReleaseKernel(g.kernel96x2);
     if (g.kernel96) CL.ReleaseKernel(g.kernel96);
@@ -1088,6 +1295,12 @@ static bool g_nogpu = false;
 // Diagnostic (--noxfer): launch the kernels but skip the host->device upload.
 // Results are meaningless; the point is to price the transfer.
 static bool g_noxfer = false;
+
+// Diagnostic (--sieve-only): run the device sieve but never launch the trial
+// factoring kernel, so the run time is the sieve's and nothing else.  Results
+// are meaningless -- nothing is tested -- but subtracting two whole-run numbers
+// could not separate the sieve from a compaction cost that moves with it.
+static bool g_sieve_only = false;
 
 // Ctrl-C / console close: stop at the next phase boundary and save a checkpoint
 // rather than losing the run.
@@ -1310,6 +1523,9 @@ static void check_small_primes_in_range(uint64_t p, U128 fmin, U128 fmax,
 //  plus one line appended to the results file.  Nothing here is taken from the
 //  GPU on trust -- every field is recomputed on the CPU.
 // ---------------------------------------------------------------------------
+// Identifies the program in GIMPS result lines, as mfaktc's version string does.
+#define TF_PROGRAM_ID MTF_NAME " " MTF_VERSION
+
 static void report_factor(uint64_t p, U128 q, const Config& cfg)
 {
     bool verified = u128_eq(h_pow2_mod(p, q), u128_from(1));
@@ -1327,16 +1543,18 @@ static void report_factor(uint64_t p, U128 q, const Config& cfg)
     printf("      2^p mod q = 1 : %s  (recomputed on the CPU)\n", verified ? "VERIFIED" : "*** FAILED ***");
     printf("      q is      : %s\n", pl);
 
+    // GIMPS manual-submission format.  Paste results.txt straight into
+    // https://www.mersenne.org/manual_result/ -- these are the exact lines that
+    // page parses, so nothing has to be reformatted by hand.
     FILE* rf = fopen(cfg.results_file.c_str(), "a");
     if (rf) {
-        SYSTEMTIME lt; GetLocalTime(&lt);
-        fprintf(rf, "%04d-%02d-%02d %02d:%02d:%02d  p=%llu  q=%s  k=%s  bits=%d  %s  %s\n",
-                lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond,
-                (unsigned long long)p, u128_to_dec(q).c_str(), u128_to_dec(kq).c_str(),
-                u128_bitlen(q), verified ? "verified" : "VERIFY-FAILED", pl);
+        fprintf(rf, "M%llu has a factor: %s [TF:%d:%d:%s]\n",
+                (unsigned long long)p, u128_to_dec(q).c_str(),
+                cfg.bit_lo, cfg.bit_hi, TF_PROGRAM_ID);
         fclose(rf);
         printf("      logged to : %s\n", cfg.results_file.c_str());
     }
+    if (!verified) printf("      *** NOT logged as verified -- CPU check failed ***\n");
     printf("\n");
     fflush(stdout);
 }
@@ -1381,6 +1599,10 @@ struct Level {
     U128 qhi_excl;
     U128 qhi_disp;          // what to print as the upper end
     U128 candidates;        // k on the wheel inside this level
+    int  bit_lo, bit_hi;    // the level as GIMPS names it: 2^bit_lo .. 2^bit_hi
+    bool full;              // false when the range stops inside this level, in
+                            // which case it is NOT a cleared bit level and must
+                            // not be reported to GIMPS as one
 };
 
 static std::vector<Level> build_levels(uint64_t p, const Wheel& wh, U128 fmin, U128 fmax,
@@ -1392,6 +1614,8 @@ static std::vector<Level> build_levels(uint64_t p, const Wheel& wh, U128 fmin, U
     if (u128_lt(kmax, kmin)) return out;
 
     U128 klo = kmin, qlo = fmin;
+    int prev_e = u128_bitlen(fmin) - 1;               // where this range starts
+    if (prev_e < 0) prev_e = 0;
     for (int e = 40; e <= 127; ++e) {
         if (e > 40 && e < 50) continue;               // below 2^60 the levels are
         if (e > 50 && e < 60) continue;               // decades, not single bits
@@ -1410,10 +1634,14 @@ static std::vector<Level> build_levels(uint64_t p, const Wheel& wh, U128 fmin, U
         L.qhi_excl = truncated ? u128_add(fmax, ONE) : V;
         L.qhi_disp = truncated ? fmax : V;
         L.candidates = wheel_k_count(wh, klo, khi);
+        L.bit_lo = prev_e;
+        L.bit_hi = e;
+        L.full   = !truncated;
         if (!u128_is_zero(L.candidates)) out.push_back(L);   // empty level: nothing to scan
 
         klo = u128_add(khi, ONE);
         qlo = V;
+        prev_e = e;
         if (u128_gt(klo, kmax)) break;
     }
     return out;
@@ -1442,15 +1670,16 @@ static void log_level(const Config& cfg, uint64_t p, const Level& L,
            level_label(L).c_str(), u128_to_dec(L.candidates).c_str(), nf);
     fflush(stdout);
 
-    FILE* rf = fopen(cfg.results_file.c_str(), "a");
-    if (!rf) { printf("  ! could not write to %s\n", cfg.results_file.c_str()); return; }
-    SYSTEMTIME lt; GetLocalTime(&lt);
-    fprintf(rf, "%04d-%02d-%02d %02d:%02d:%02d  p=%llu  level=%s..%s  status=complete"
-                "  factors=%d  candidates=%s\n",
-            lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond,
-            (unsigned long long)p, u128_to_pow2(L.qlo).c_str(),
-            u128_to_pow2(L.qhi_disp).c_str(), nf, u128_to_dec(L.candidates).c_str());
-    fclose(rf);
+    // One GIMPS "no factor" line per bit level, written as the level clears.
+    // A level that found something is covered by its "has a factor" line, so it
+    // is not also reported clean.
+    if (nf == 0 && L.full) {
+        FILE* rf = fopen(cfg.results_file.c_str(), "a");
+        if (!rf) { printf("  ! could not write to %s\n", cfg.results_file.c_str()); return; }
+        fprintf(rf, "no factor for M%llu from 2^%d to 2^%d [%s]\n",
+                (unsigned long long)p, L.bit_lo, L.bit_hi, TF_PROGRAM_ID);
+        fclose(rf);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1463,9 +1692,9 @@ static void log_level(const Config& cfg, uint64_t p, const Level& L,
 static void report_run(uint64_t p, const Config& cfg,
                        const std::vector<U128>& factors, const RunStats& stats)
 {
-    FILE* rf = fopen(cfg.results_file.c_str(), "a");
+    FILE* rf = fopen(cfg.log_file.c_str(), "a");
     if (!rf) {
-        printf("  ! could not write the run record to %s\n", cfg.results_file.c_str());
+        printf("  ! could not write the run record to %s\n", cfg.log_file.c_str());
         fflush(stdout);
         return;
     }
@@ -1484,7 +1713,7 @@ static void report_run(uint64_t p, const Config& cfg,
             (int)factors.size(),
             (unsigned long long)stats.k_scanned, (unsigned long long)stats.gpu_tested, tbuf);
     fclose(rf);
-    printf("          run recorded in %s\n", cfg.results_file.c_str());
+    printf("          run recorded in %s\n", cfg.log_file.c_str());
     fflush(stdout);
 }
 
@@ -1573,13 +1802,86 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
     const int NSLOT = std::max(2, std::min(8, cfg.gpu_slots));
     cl_int st = CL_SUCCESS;
     std::vector<cl_mem>   idx_buf(NSLOT, nullptr);
+    // Survivor count lives on the device, not in a kernel argument.  With the
+    // sieve on the GPU the count is only known there, and reading it back to
+    // size the launch would put a host round trip in the middle of every
+    // segment; instead the kernel reads it and surplus threads exit.  The CPU
+    // sieve path writes the same buffer, so both paths launch identically.
+    std::vector<cl_mem>   n_buf(NSLOT, nullptr);
     std::vector<cl_event> evt(NSLOT, nullptr);      // kernel completion
     std::vector<cl_event> wr_evt(NSLOT, nullptr);   // upload completion
+    std::vector<cl_event> n_evt(NSLOT, nullptr);    // count upload completion
     std::vector<Batch>    live(NSLOT);
     for (int i = 0; i < NSLOT; ++i) {
         idx_buf[i] = CL.CreateBuffer(g.ctx, CL_MEM_READ_ONLY, (size_t)SEG * sizeof(uint32_t), nullptr, &st);
         if (!idx_buf[i] || st != CL_SUCCESS) { err = "clCreateBuffer(index) failed"; return false; }
+        n_buf[i] = CL.CreateBuffer(g.ctx, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &st);
+        if (!n_buf[i] || st != CL_SUCCESS) { err = "clCreateBuffer(count) failed"; return false; }
     }
+    // ---- the device sieve: prime table, per-slot bitmaps, launch plan --------
+    //
+    // Primes are grouped by octave.  Below TIER_MAX_BITS a thread owns a window
+    // of the bitmap and strikes without atomics, which is what makes the sieve
+    // affordable; the window is sized to about two strikes per prime, so it
+    // doubles with the primes.  Above that a word-owning thread would mostly
+    // idle, so those primes go to the atomic kernel instead.
+    struct SieveLaunch { uint32_t first, last, wpt; };
+    std::vector<SieveLaunch> plan;             // octave windows
+    size_t   small_last  = 0;                  // primes [0, small_last) -> small kernel
+    uint32_t large_first = 0, large_last = 0;  // the rest -> tile kernel
+    std::vector<cl_mem> bits_buf(NSLOT, nullptr), offs_buf(NSLOT, nullptr);
+    cl_mem s_buf = nullptr, k0_buf = nullptr, invW_buf = nullptr, rc_buf = nullptr, ptot_buf = nullptr;
+    const uint32_t NWORDS = (uint32_t)((SEG + 31) / 32);
+    if (cfg.sieve_on_gpu && !sp.empty()) {
+        // Split point measured, not assumed: below 64 a prime hits every
+        // 32-bit word so the register-accumulating kernel always has work;
+        // above it, most threads would divide only to find they have none, and
+        // the tile kernel's one division per (prime, tile) wins instead.
+        const uint32_t SMALL_MAX = 64;
+        std::vector<uint32_t> vs(sp.size()), vk0(sp.size()), vinv(sp.size()), vrc(sp.size());
+        for (size_t i = 0; i < sp.size(); ++i) {
+            vs[i] = sp[i].s; vk0[i] = sp[i].k0; vinv[i] = sp[i].invW;
+            // floor(2^32 / s): lets the sieve kernels take n mod s with a
+            // multiply-high instead of an integer division.  See mod_recip().
+            vrc[i] = (uint32_t)(0x100000000ULL / sp[i].s);
+        }
+        small_last = 0;
+        while (small_last < sp.size() && sp[small_last].s < SMALL_MAX) ++small_last;
+
+        // Octave windows carry the middle band; the tile kernel takes the rest.
+        const uint32_t TIER_MAX_BITS = 2048;
+        size_t i = small_last;
+        while (i < sp.size()) {
+            uint32_t lo = 1; while (lo * 2u <= sp[i].s) lo *= 2u;
+            size_t j = i; while (j < sp.size() && sp[j].s < lo * 2u) ++j;
+            uint64_t win = (uint64_t)lo * 2u;
+            if (win > TIER_MAX_BITS) break;
+            SieveLaunch L;
+            L.first = (uint32_t)i; L.last = (uint32_t)j;
+            L.wpt = (uint32_t)std::max<uint64_t>(1, win / 32);
+            plan.push_back(L);
+            i = j;
+        }
+        large_first = (uint32_t)i;
+        large_last  = (uint32_t)sp.size();
+
+        cl_int s1 = CL_SUCCESS;
+        auto up = [&](const std::vector<uint32_t>& v) {
+            cl_mem m = CL.CreateBuffer(g.ctx, CL_MEM_READ_ONLY, v.size() * 4, nullptr, &s1);
+            if (m) CL.EnqueueWriteBuffer(g.queue, m, CL_TRUE, 0, v.size() * 4, v.data(), 0, nullptr, nullptr);
+            return m;
+        };
+        s_buf = up(vs); k0_buf = up(vk0); invW_buf = up(vinv); rc_buf = up(vrc);
+        ptot_buf = CL.CreateBuffer(g.ctx, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &s1);
+        for (int b = 0; b < NSLOT; ++b) {
+            bits_buf[b] = CL.CreateBuffer(g.ctx, CL_MEM_READ_WRITE, (size_t)NWORDS * 4, nullptr, &s1);
+            offs_buf[b] = CL.CreateBuffer(g.ctx, CL_MEM_READ_WRITE, sp.size() * 4, nullptr, &s1);
+        }
+        if (!s_buf || !k0_buf || !invW_buf || !rc_buf || !ptot_buf || !bits_buf[0] || !offs_buf[0] || s1 != CL_SUCCESS) {
+            err = "clCreateBuffer(sieve) failed - lower segment_size"; return false;
+        }
+    }
+
     const uint32_t FOUND_CAP = 256;
     uint32_t zero = 0;
     cl_mem cnt_buf = CL.CreateBuffer(g.ctx, CL_MEM_READ_WRITE, sizeof(uint32_t), nullptr, &st);
@@ -1602,16 +1904,32 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
     //      else     64-bit limbs
     //  arithmetic = 72/96/128 forces a width; a forced width that cannot hold
     //  the candidates is ignored, never silently used.
-    auto pick_kernel = [&](U128 level_hi_excl, cl_kernel& K, size_t& WG, const char*& nm) {
+    // vpt = candidates per work item.  A 2-wide kernel is handed the same n but
+    // launches half the threads, so the caller must size the grid by n/vpt --
+    // getting this wrong silently tests only half the range, which is why it is
+    // returned here rather than inferred at the launch site.
+    auto pick_kernel = [&](U128 level_hi_excl, cl_kernel& K, size_t& WG, const char*& nm, uint32_t& vpt) {
         const U128 B64 = u128_shl(u128_from(1), 64);
         const U128 B70 = u128_shl(u128_from(1), 70);
         const U128 B72 = u128_shl(u128_from(1), 72);
         const U128 B96 = u128_shl(u128_from(1), 96);
         const int  a   = cfg.arithmetic;
+        const int  v   = cfg.vector;
+        vpt = 1;
         if      (!u128_gt(level_hi_excl, B64) && (a == 0 || a == 64)) { K = g.kernel64;  WG = g.wg64;  nm = "64-bit, two 32-bit limbs"; }
-        else if (!u128_gt(level_hi_excl, B70) && (a == 0 || a == 72 || a == 64)) { K = g.kernel72L; WG = g.wg72L; nm = "72-bit, 24-bit limbs, lazy"; }
+        else if (!u128_gt(level_hi_excl, B70) && (a == 0 || a == 72 || a == 64)) {
+            // The lazy 72-bit path is the one the wavefront actually uses, so it is
+            // the one that carries a vectorised variant.  auto picks 2-wide: it
+            // measured faster on every level tested, and the extra registers only
+            // cost occupancy the 1-wide kernel could not use anyway.
+            if (v == 1) { K = g.kernel72L;   WG = g.wg72L;   nm = "72-bit, 24-bit limbs, lazy"; }
+            else        { K = g.kernel72Lx2; WG = g.wg72Lx2; nm = "72-bit, 24-bit limbs, lazy, x2"; vpt = 2; }
+        }
         else if (!u128_gt(level_hi_excl, B72) && (a == 0 || a == 72)) { K = g.kernel72;  WG = g.wg72;  nm = "72-bit, three 24-bit limbs"; }
-        else if (!u128_gt(level_hi_excl, B96) && (a == 0 || a == 96 || a == 72)) { K = g.kernel96; WG = g.wg96; nm = "96-bit, three 32-bit limbs"; }
+        else if (!u128_gt(level_hi_excl, B96) && (a == 0 || a == 96 || a == 72)) {
+            if (v == 2) { K = g.kernel96x2; WG = g.wg96x2; nm = "96-bit, three 32-bit limbs, x2"; vpt = 2; }
+            else        { K = g.kernel96;   WG = g.wg96;   nm = "96-bit, three 32-bit limbs"; }
+        }
         else                                                          { K = g.kernel;   WG = g.wg_size; nm = "128-bit, two 64-bit limbs"; }
         if (cfg.workgroup > 0) WG = (size_t)cfg.workgroup;
     };
@@ -1720,7 +2038,8 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
         cl_kernel   K  = nullptr;
         size_t      WG = 64;
         const char* knm = "";
-        pick_kernel(L.qhi_excl, K, WG, knm);
+        uint32_t    VPT = 1;
+        pick_kernel(L.qhi_excl, K, WG, knm, VPT);
         if (verbose && knm != last_knm) {
             clear_line();
             printf("  arithmetic : %s   (level %s)\n", knm, lvl.c_str());
@@ -1822,7 +2141,20 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
             const uint64_t phase_scan0 = scanned_total.load();
             const uint64_t phase_gpu0  = survivors_total.load();
 
-            int nthreads = cfg.threads > 0 ? cfg.threads : (int)std::thread::hardware_concurrency() - 1;
+            // The device accumulates this phase's survivor count; a phase holds at
+            // most a few hundred million, well inside 32 bits.
+            if (cfg.sieve_on_gpu && ptot_buf) {
+                uint32_t z = 0;
+                CL.EnqueueWriteBuffer(g.queue, ptot_buf, CL_TRUE, 0, sizeof(z), &z, 0, nullptr, nullptr);
+            }
+
+            // With the sieve on the device there is no host work to spread: one
+            // producer just hands the consumer segment descriptors and the GPU
+            // does the rest.  Spawning the usual pile of threads here would only
+            // add contention with the thread driving the queue.
+            int nthreads = cfg.sieve_on_gpu
+                         ? 1
+                         : (cfg.threads > 0 ? cfg.threads : (int)std::thread::hardware_concurrency() - 1);
             if (nthreads < 1) nthreads = 1;
             if (nthreads > 32) nthreads = 32;
 
@@ -1847,6 +2179,17 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                         b.base_k  = u128_add(cls[ci].kc0, u128_mul_u64(u128_from(off), W));
                         b.scanned = len;
 
+                        // Device sieve: nothing to do here but say where the
+                        // segment starts and how long it is.  count stays 0 --
+                        // only the GPU will know it -- and buf stays -1 so the
+                        // consumer knows there is no pinned buffer to release.
+                        if (cfg.sieve_on_gpu) {
+                            b.data = nullptr; b.count = 0; b.buf = -1;
+                            scanned_total.fetch_add(len);
+                            if (queue.push(std::move(b))) continue;
+                            break;
+                        }
+
                         // A bitmap, not a byte array: a 4M-candidate segment is
                         // 512 KB this way and stays resident in L2, which is worth
                         // several times the cost of the bit twiddling.
@@ -1855,11 +2198,11 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
 
                         // ---- pre-factoring: strike out every k whose q has a
                         //      small prime factor -------------------------------
-                        //  A prime only earns its keep if the candidates it removes
-                        //  cost the GPU more than the setup costs here; past about
-                        //  len/8 it strikes too few positions to be worth it, which
-                        //  also stops tiny ranges paying for a huge prime table.
-                        const uint32_t pcap = (len > 8192) ? (len / 8) : 1024u;
+                        //  Primes above the segment's cap are skipped -- see
+                        //  sieve_prime_cap_for().  The run header reports the same
+                        //  cap, so a sieve_primes the segment cannot reach is
+                        //  visible up front rather than silently ignored.
+                        const uint32_t pcap = sieve_prime_cap_for(len);
 
                         // First strike position for each prime, once per segment.
                         size_t np = 0;
@@ -1930,16 +2273,107 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                     evt[slot] = nullptr;
                 }
                 if (wr_evt[slot]) { CL.ReleaseEvent(wr_evt[slot]); wr_evt[slot] = nullptr; }
+                if (n_evt[slot])  { CL.ReleaseEvent(n_evt[slot]);  n_evt[slot]  = nullptr; }
                 pool.release(live[slot].buf);            // its kernel has finished
                 live[slot] = std::move(b);
                 const uint32_t n = live[slot].count;
 
+                if (cfg.sieve_on_gpu) {
+                    // scanned is at most SEG, which the config caps at 2^28
+                    const uint32_t len   = (uint32_t)live[slot].scanned;
+                    const uint32_t nw    = (len + 31u) / 32u;
+                    uint64_t bl = live[slot].base_k.lo, bh = live[slot].base_k.hi;
+                    const uint32_t np    = (uint32_t)sp.size();
+                    auto enq = [&](cl_kernel K, size_t gx, size_t gy, size_t lx) {
+                        size_t gs[2] = { ((gx + lx - 1) / lx) * lx, gy };
+                        size_t ls[2] = { lx, 1 };
+                        return CL.EnqueueNDRangeKernel(g.queue, K, gy > 1 ? 2 : 1, nullptr, gs, ls, 0, nullptr, nullptr);
+                    };
+                    // The queue is in-order, so each of these sees the previous
+                    // one's writes without a single event or barrier.  Four
+                    // launches per segment: offsets, small primes, large primes,
+                    // compact.  The bitmap clear and the counter reset fold into
+                    // sieve_mark_small, which is the first kernel to touch both.
+                    int a = 0;
+                    CL.SetKernelArg(g.k_offsets, a++, sizeof(cl_mem), &s_buf);
+                    CL.SetKernelArg(g.k_offsets, a++, sizeof(cl_mem), &k0_buf);
+                    CL.SetKernelArg(g.k_offsets, a++, sizeof(cl_mem), &invW_buf);
+                    CL.SetKernelArg(g.k_offsets, a++, sizeof(uint32_t), &np);
+                    CL.SetKernelArg(g.k_offsets, a++, sizeof(uint64_t), &bl);
+                    CL.SetKernelArg(g.k_offsets, a++, sizeof(uint64_t), &bh);
+                    CL.SetKernelArg(g.k_offsets, a++, sizeof(cl_mem), &offs_buf[slot]);
+                    enq(g.k_offsets, np, 1, 64);
+
+                    {
+                        const uint32_t f0 = 0, f1 = (uint32_t)small_last;
+                        a = 0;
+                        CL.SetKernelArg(g.k_tier, a++, sizeof(cl_mem), &bits_buf[slot]);
+                        CL.SetKernelArg(g.k_tier, a++, sizeof(cl_mem), &s_buf);
+                        CL.SetKernelArg(g.k_tier, a++, sizeof(cl_mem), &rc_buf);
+                        CL.SetKernelArg(g.k_tier, a++, sizeof(cl_mem), &offs_buf[slot]);
+                        CL.SetKernelArg(g.k_tier, a++, sizeof(uint32_t), &f0);
+                        CL.SetKernelArg(g.k_tier, a++, sizeof(uint32_t), &f1);
+                        CL.SetKernelArg(g.k_tier, a++, sizeof(uint32_t), &len);
+                        CL.SetKernelArg(g.k_tier, a++, sizeof(cl_mem), &n_buf[slot]);
+                        enq(g.k_tier, nw, 1, 256);
+                    }
+                    for (const SieveLaunch& L : plan) {
+                        const size_t TWG = 64;
+                        a = 0;
+                        CL.SetKernelArg(g.k_oct, a++, sizeof(cl_mem), &bits_buf[slot]);
+                        CL.SetKernelArg(g.k_oct, a++, sizeof(cl_mem), &s_buf);
+                        CL.SetKernelArg(g.k_oct, a++, sizeof(cl_mem), &rc_buf);
+                        CL.SetKernelArg(g.k_oct, a++, sizeof(cl_mem), &offs_buf[slot]);
+                        CL.SetKernelArg(g.k_oct, a++, sizeof(uint32_t), &L.first);
+                        CL.SetKernelArg(g.k_oct, a++, sizeof(uint32_t), &L.last);
+                        CL.SetKernelArg(g.k_oct, a++, sizeof(uint32_t), &len);
+                        CL.SetKernelArg(g.k_oct, a++, sizeof(uint32_t), &L.wpt);
+                        CL.SetKernelArg(g.k_oct, a++, TWG * L.wpt * sizeof(uint32_t), nullptr);
+                        size_t threads = ((size_t)len + (size_t)L.wpt * 32 - 1) / ((size_t)L.wpt * 32);
+                        enq(g.k_oct, threads, 1, TWG);
+                    }
+                    if (large_last > large_first) {
+                        const uint32_t TILE = 1024;      // words: 32768 bits, 4 KB of LDS
+                        const size_t   LWG  = 256;
+                        a = 0;
+                        CL.SetKernelArg(g.k_large, a++, sizeof(cl_mem), &bits_buf[slot]);
+                        CL.SetKernelArg(g.k_large, a++, sizeof(cl_mem), &s_buf);
+                        CL.SetKernelArg(g.k_large, a++, sizeof(cl_mem), &rc_buf);
+                        CL.SetKernelArg(g.k_large, a++, sizeof(cl_mem), &offs_buf[slot]);
+                        CL.SetKernelArg(g.k_large, a++, sizeof(uint32_t), &large_first);
+                        CL.SetKernelArg(g.k_large, a++, sizeof(uint32_t), &large_last);
+                        CL.SetKernelArg(g.k_large, a++, sizeof(uint32_t), &len);
+                        CL.SetKernelArg(g.k_large, a++, sizeof(uint32_t), &TILE);
+                        CL.SetKernelArg(g.k_large, a++, TILE * sizeof(uint32_t), nullptr);
+                        size_t groups = (nw + TILE - 1) / TILE;
+                        enq(g.k_large, groups * LWG, 1, LWG);
+                    }
+
+                    a = 0;
+                    CL.SetKernelArg(g.k_compact, a++, sizeof(cl_mem), &bits_buf[slot]);
+                    CL.SetKernelArg(g.k_compact, a++, sizeof(uint32_t), &len);
+                    CL.SetKernelArg(g.k_compact, a++, sizeof(cl_mem), &idx_buf[slot]);
+                    CL.SetKernelArg(g.k_compact, a++, sizeof(cl_mem), &n_buf[slot]);
+                    CL.SetKernelArg(g.k_compact, a++, sizeof(cl_mem), &ptot_buf);
+                    st = enq(g.k_compact, nw, 1, 64);
+                    if (st != CL_SUCCESS) { err = "sieve kernel launch failed (" + std::to_string(st) + ")"; request_abort(); break; }
+                }
+
                 // Upload on the transfer queue so the copy engine can work while the
                 // previous batch is still computing; the kernel below waits on it.
-                if (!g_noxfer) {
+                if (!cfg.sieve_on_gpu && !g_noxfer) {
                     st = CL.EnqueueWriteBuffer(g.xfer, idx_buf[slot], CL_FALSE, 0,
                                                n * sizeof(uint32_t), live[slot].data, 0, nullptr, &wr_evt[slot]);
                     if (st != CL_SUCCESS) { err = "clEnqueueWriteBuffer failed"; request_abort(); break; }
+                }
+                // The count goes up even under --noxfer: that diagnostic is meant to
+                // price the index upload, and skipping four bytes here would instead
+                // launch the kernel against an uninitialised count.  On the device
+                // path sieve_compact has already written it.
+                if (!cfg.sieve_on_gpu) {
+                    st = CL.EnqueueWriteBuffer(g.xfer, n_buf[slot], CL_FALSE, 0,
+                                               sizeof(uint32_t), &live[slot].count, 0, nullptr, &n_evt[slot]);
+                    if (st != CL_SUCCESS) { err = "clEnqueueWriteBuffer(count) failed"; request_abort(); break; }
                     CL.Flush(g.xfer);
                 }
 
@@ -1947,7 +2381,7 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                 uint64_t step = W, pe = p;
                 int argi = 0;
                 CL.SetKernelArg(K, argi++,sizeof(cl_mem),   &idx_buf[slot]);
-                CL.SetKernelArg(K, argi++,sizeof(uint32_t), &n);
+                CL.SetKernelArg(K, argi++,sizeof(cl_mem),   &n_buf[slot]);
                 CL.SetKernelArg(K, argi++,sizeof(uint64_t), &base_lo);
                 CL.SetKernelArg(K, argi++,sizeof(uint64_t), &base_hi);
                 CL.SetKernelArg(K, argi++,sizeof(uint64_t), &step);
@@ -1958,11 +2392,26 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                 CL.SetKernelArg(K, argi++,sizeof(cl_mem),   &res_buf);
                 CL.SetKernelArg(K, argi++,sizeof(uint32_t), &FOUND_CAP);
 
+                // A vpt-wide kernel covers vpt candidates per work item, so the grid
+                // is sized by the thread count, not the candidate count.
+                //
+                // On the device path the host does not know the survivor count --
+                // that is the whole point -- so the grid covers the worst case, all
+                // len candidates surviving, and the roughly four in five threads
+                // with nothing to do read the count and exit. Measured cheaper than
+                // reading the count back to size the launch exactly, because that
+                // read would drain the pipeline once per segment.
                 size_t local  = WG;
-                size_t global = ((n + local - 1) / local) * local;
+                size_t cover  = cfg.sieve_on_gpu ? live[slot].scanned : n;
+                size_t items  = (cover + VPT - 1) / VPT;
+                size_t global = ((items + local - 1) / local) * local;
+                // Both uploads must land before the kernel reads them.
+                if (g_sieve_only) { ++launches; continue; }   // price the sieve alone
+                cl_event wait[2]; cl_uint nwait = 0;
+                if (wr_evt[slot]) wait[nwait++] = wr_evt[slot];
+                if (n_evt[slot])  wait[nwait++] = n_evt[slot];
                 st = CL.EnqueueNDRangeKernel(g.queue, K, 1, nullptr, &global, &local,
-                                             wr_evt[slot] ? 1u : 0u,
-                                             wr_evt[slot] ? &wr_evt[slot] : nullptr, &evt[slot]);
+                                             nwait, nwait ? wait : nullptr, &evt[slot]);
                 if (st != CL_SUCCESS) { err = "clEnqueueNDRangeKernel failed (" + std::to_string(st) + ")"; request_abort(); break; }
                 ++launches;
 
@@ -1973,13 +2422,35 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                     double el  = std::chrono::duration<double>(now - t0).count();
                     uint64_t sc = scanned_total.load(), sv = survivors_total.load();
 
+                    // On the device path survivors_total only takes up the count
+                    // at each phase boundary, so mid-phase it is stale and "sieved"
+                    // would read 100% until the first phase ends.  Pick up the
+                    // running phase counter for display only -- twice a second,
+                    // against the ~80 blocking reads drain_hits() already does, so
+                    // it is not the per-segment stall this replaced.
+                    if (cfg.sieve_on_gpu && ptot_buf) {
+                        uint32_t live_ptot = 0;
+                        if (CL.EnqueueReadBuffer(g.queue, ptot_buf, CL_TRUE, 0,
+                                                 sizeof(live_ptot), &live_ptot, 0, nullptr, nullptr) == CL_SUCCESS)
+                            sv += live_ptot;
+                    }
+
                     // Rates must count only work done in THIS run: on a resumed run
                     // the totals start at the checkpointed values, which would
                     // otherwise be credited to this run's clock.
                     uint64_t sc_now = sc - resumed_scan;
                     uint64_t sv_now = sv - resumed_gpu;
-                    double rate  = el > 0 ? sv_now / el : 0.0;
-                    double kps   = (el > 0) ? (double)sc_now / el : 0.0;   // k scanned per second
+                    (void)sv_now;
+                    // The rate on the progress line counts EVERY candidate the run
+                    // disposed of, sieved out or tested, not just the ones that
+                    // reached the GPU.  Those are two different questions and only
+                    // this one measures progress: sieving deeper removes candidates
+                    // instead of testing them, so a GPU-only rate falls exactly when
+                    // the job is getting faster, which reads as a slowdown.  It also
+                    // makes the number comparable between runs at different
+                    // sieve_primes, which a GPU-only rate is not.
+                    double kps   = (el > 0) ? (double)sc_now / el : 0.0;
+                    double rate  = kps;
 
                     // The percentage tracks the level being scanned, not the whole
                     // job -- a level is the unit of work that finishes and gets
@@ -2017,15 +2488,15 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                         switch (tier) {
                         case 0:
                             snprintf(line, sizeof(line),
-                                     "  %s %6.2f%%  %llu tested (%.0f M/s)  %s  sieved %.1f%%  elapsed %s  ETA %s  job %s",
-                                     lvl.c_str(), frac * 100.0, (unsigned long long)sv, rate / 1e6,
+                                     "  %s %6.2f%%  %llu done (%.0f M/s)  %s  sieved %.1f%%  elapsed %s  ETA %s  job %s",
+                                     lvl.c_str(), frac * 100.0, (unsigned long long)sc, rate / 1e6,
                                      cls, sieved, fmt_duration(el).c_str(),
                                      fmt_duration(eta_lvl).c_str(), fmt_duration(eta_job).c_str());
                             break;
                         case 1:
                             snprintf(line, sizeof(line),
-                                     "  %s %6.2f%%  %llu tested (%.0f M/s)  %s  ETA %s  job %s",
-                                     lvl.c_str(), frac * 100.0, (unsigned long long)sv, rate / 1e6,
+                                     "  %s %6.2f%%  %llu done (%.0f M/s)  %s  ETA %s  job %s",
+                                     lvl.c_str(), frac * 100.0, (unsigned long long)sc, rate / 1e6,
                                      cls, fmt_duration(eta_lvl).c_str(), fmt_duration(eta_job).c_str());
                             break;
                         case 2:
@@ -2067,8 +2538,14 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
             for (int i = 0; i < NSLOT; ++i) {
                 if (evt[i])    { CL.ReleaseEvent(evt[i]);    evt[i]    = nullptr; }
                 if (wr_evt[i]) { CL.ReleaseEvent(wr_evt[i]); wr_evt[i] = nullptr; }
+                if (n_evt[i])  { CL.ReleaseEvent(n_evt[i]);  n_evt[i]  = nullptr; }
                 pool.release(live[i].buf);
                 live[i] = Batch();
+            }
+            if (cfg.sieve_on_gpu && ptot_buf) {
+                uint32_t got = 0;
+                CL.EnqueueReadBuffer(g.queue, ptot_buf, CL_TRUE, 0, sizeof(got), &got, 0, nullptr, nullptr);
+                survivors_total.fetch_add(got);
             }
             if (!err.empty()) break;
 
@@ -2154,6 +2631,14 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
     pool.stop();
     pool.shutdown(g);
     for (int i = 0; i < NSLOT; ++i) if (idx_buf[i]) CL.ReleaseMemObject(idx_buf[i]);
+    for (int i = 0; i < NSLOT; ++i) if (n_buf[i])   CL.ReleaseMemObject(n_buf[i]);
+    for (int i = 0; i < NSLOT; ++i) if (bits_buf[i]) CL.ReleaseMemObject(bits_buf[i]);
+    for (int i = 0; i < NSLOT; ++i) if (offs_buf[i]) CL.ReleaseMemObject(offs_buf[i]);
+    if (s_buf)    CL.ReleaseMemObject(s_buf);
+    if (k0_buf)   CL.ReleaseMemObject(k0_buf);
+    if (invW_buf) CL.ReleaseMemObject(invW_buf);
+    if (rc_buf)   CL.ReleaseMemObject(rc_buf);
+    if (ptot_buf) CL.ReleaseMemObject(ptot_buf);
     CL.ReleaseMemObject(cnt_buf);
     CL.ReleaseMemObject(res_buf);
 
@@ -2195,10 +2680,12 @@ static void bench_device(Gpu& g, const Config& cfg)
     cl_mem ibuf = CL.CreateBuffer(g.ctx, CL_MEM_READ_ONLY,  (size_t)N * 4, nullptr, &st);
     cl_mem cbuf = CL.CreateBuffer(g.ctx, CL_MEM_READ_WRITE, 4, nullptr, &st);
     cl_mem rbuf = CL.CreateBuffer(g.ctx, CL_MEM_READ_WRITE, 256 * 16, nullptr, &st);
+    cl_mem nbuf = CL.CreateBuffer(g.ctx, CL_MEM_READ_WRITE, 4, nullptr, &st);
     if (st != CL_SUCCESS) { printf("  benchmark: buffer allocation failed\n"); return; }
     CL.EnqueueWriteBuffer(g.queue, ibuf, CL_TRUE, 0, (size_t)N * 4, idx.data(), 0, nullptr, nullptr);
     uint32_t zero = 0;
     CL.EnqueueWriteBuffer(g.queue, cbuf, CL_TRUE, 0, 4, &zero, 0, nullptr, nullptr);
+    CL.EnqueueWriteBuffer(g.queue, nbuf, CL_TRUE, 0, 4, &N,    0, nullptr, nullptr);
 
     printf("\n  pure GPU kernel throughput (one batch, no sieve, no transfers)\n");
     printf("  %-12s %-6s %-10s %-12s %s\n", "exponent", "pbits", "candidate", "kernel", "rate");
@@ -2207,11 +2694,23 @@ static void bench_device(Gpu& g, const Config& cfg)
         int pbits = 0; { uint64_t t = p; while (t) { ++pbits; t >>= 1; } }
         uint64_t twop = 2 * p;
 
-      for (int which = 0; which < 3; ++which) {
-        cl_kernel K   = (which == 0) ? g.kernel : (which == 1) ? g.kernel96 : g.kernel96x2;
-        size_t    WG  = (which == 0) ? g.wg_size : (which == 1) ? g.wg96 : g.wg96x2;
-        const char* nm = (which == 0) ? "128-bit/64" : (which == 1) ? "96-bit/32" : "96-bit x2";
-        const uint32_t per_item = (which == 2) ? 2u : 1u;
+      // Includes the 72-bit lazy pair: it is the kernel a real run at the GIMPS
+      // wavefront actually uses, so leaving it out of the one measurement that
+      // isolates the GPU made the bench answer a question nobody was asking.
+      // Throughput only -- the candidates are arbitrary and the results ignored,
+      // so the 72-bit rows are meaningful even at a level above their exact bound.
+      static const struct { const char* nm; int sel; uint32_t vpt; } BK[] = {
+          { "128-bit/64", 0, 1 }, { "96-bit/32", 1, 1 }, { "96-bit x2", 2, 2 },
+          { "72-bit/24L", 3, 1 }, { "72-bit x2", 4, 2 },
+      };
+      for (int which = 0; which < (int)(sizeof(BK)/sizeof(BK[0])); ++which) {
+        const int sel = BK[which].sel;
+        cl_kernel K   = (sel == 0) ? g.kernel   : (sel == 1) ? g.kernel96 :
+                        (sel == 2) ? g.kernel96x2 : (sel == 3) ? g.kernel72L : g.kernel72Lx2;
+        size_t    WG  = (sel == 0) ? g.wg_size  : (sel == 1) ? g.wg96 :
+                        (sel == 2) ? g.wg96x2   : (sel == 3) ? g.wg72L : g.wg72Lx2;
+        const char* nm = BK[which].nm;
+        const uint32_t per_item = BK[which].vpt;
         if (cfg.workgroup > 0) WG = (size_t)cfg.workgroup;
 
         for (int level : { 70, 90 }) {
@@ -2220,10 +2719,10 @@ static void bench_device(Gpu& g, const Config& cfg)
             u128_divmod(u128_shl(u128_from(1), (unsigned)level), u128_from(twop), kbase, rem);
             if (u128_is_zero(kbase)) kbase = u128_from(1);
             uint64_t base_lo = kbase.lo, base_hi = kbase.hi, step = 4;
-            uint32_t cap = 256, n = N;
+            uint32_t cap = 256;
             int argi = 0;
             CL.SetKernelArg(K, argi++,sizeof(cl_mem),   &ibuf);
-            CL.SetKernelArg(K, argi++,sizeof(uint32_t), &n);
+            CL.SetKernelArg(K, argi++,sizeof(cl_mem),   &nbuf);
             CL.SetKernelArg(K, argi++,sizeof(uint64_t), &base_lo);
             CL.SetKernelArg(K, argi++,sizeof(uint64_t), &base_hi);
             CL.SetKernelArg(K, argi++,sizeof(uint64_t), &step);
@@ -2255,6 +2754,7 @@ static void bench_device(Gpu& g, const Config& cfg)
     CL.ReleaseMemObject(ibuf);
     CL.ReleaseMemObject(cbuf);
     CL.ReleaseMemObject(rbuf);
+    CL.ReleaseMemObject(nbuf);
     (void)cfg;
 }
 
@@ -2293,13 +2793,22 @@ static bool selftest(Gpu& g, Config cfg)
     // untested -- and the narrow kernels are exact only below their own bound,
     // so "it worked on the 96-bit path" says nothing about the 72-bit one.
     // A case whose factors exceed a width is skipped for that width, not failed.
+    // ... and through both the 1-wide and 2-wide variants where one exists.  The
+    // x2 kernels split the batch as gid / gid+nhalf and guard the odd tail with
+    // have1; get either wrong and half the candidates are silently never tested,
+    // which no amount of "the 1-wide kernel passes" would catch.
     for (int width : { 64, 72, 96, 128 }) {
+     for (int vec : { 1, 2 }) {
+      const bool has_x2 = (width == 72 || width == 96);
+      if (vec == 2 && !has_x2) continue;
       cfg.arithmetic = width;
-      printf("  -- %s --\n",
+      cfg.vector     = vec;
+      printf("  -- %s%s --\n",
              width == 64  ? "64-bit arithmetic (two 32-bit limbs)"
              : width == 72 ? "72-bit arithmetic (24-bit limbs; lazy below 2^70)"
              : width == 96 ? "96-bit arithmetic (32-bit limbs)"
-                           : "128-bit arithmetic (64-bit limbs)");
+                           : "128-bit arithmetic (64-bit limbs)",
+             !has_x2 ? "" : (vec == 2 ? ", two candidates per work item" : ", one candidate per work item"));
       for (const TestCase& tc : cases) {
         if (width == 64 || width == 72) {        // only cases that fit the width
             U128 hi; std::string e2;
@@ -2333,6 +2842,7 @@ static bool selftest(Gpu& g, Config cfg)
                (unsigned long long)tc.p, tc.fmin, gs.empty() ? "(none)" : gs.c_str());
         if (!ok) { printf("         expected: %s\n", tc.expected); ++fails; }
       }
+     }
     }
     printf("\n  %s\n", fails == 0 ? "all self tests passed" : "SELF TESTS FAILED");
     return fails == 0;
@@ -2345,7 +2855,7 @@ static bool selftest(Gpu& g, Config cfg)
 static void banner()
 {
     printf("=======================================================================\n");
-    printf(" mersenne_tf0.9  --  GPU trial factoring of M_p = 2^p - 1  (exact 128-bit)\n");
+    printf(" " MTF_NAME " " MTF_VERSION "  --  GPU trial factoring of M_p = 2^p - 1  (exact 128-bit)\n");
     printf("=======================================================================\n");
 }
 
@@ -2361,10 +2871,11 @@ static int run_main(int argc, char** argv)
         else if (a == "--bench")                  do_bench = true;
         else if (a == "--nogpu")                  g_nogpu = true;
         else if (a == "--noxfer")                 g_noxfer = true;
+        else if (a == "--sieve-only")             g_sieve_only = true;
         else if (a == "--list-devices")           do_list = true;
         else if (a == "--help" || a == "-h") {
             banner();
-            printf("\nusage: mersenne_tf0.9 [--config FILE] [--selftest] [--list-devices]\n\n"
+            printf("\nusage: " MTF_NAME ".exe [--config FILE] [--selftest] [--list-devices]\n\n"
                    "  Reads the exponent and the factor bounds from a plain text config\n"
                    "  file (default config.txt).  See README.md.\n");
             return 0;
@@ -2388,6 +2899,16 @@ static int run_main(int argc, char** argv)
         printf("\nERROR: %s\n", err.c_str());
         if (!do_selftest) return 1;
         cfg = Config();
+    }
+    // The job lives in worktodo.txt.  The self test brings its own cases, so it
+    // runs without one; every other mode needs it.
+    if (!do_selftest && !do_bench) {
+        if (!load_worktodo(cfg.worktodo_file, cfg, err)) {
+            printf("\nERROR: %s\n", err.c_str());
+            return 1;
+        }
+    } else if (cfg.exponent == 0) {
+        cfg.exponent = 1277;                  // harmless default for --bench
     }
     g_pause_mode = cfg.pause_mode;
     if (cfg.segment_size < 4096) cfg.segment_size = 4096;
@@ -2445,6 +2966,7 @@ static int run_main(int argc, char** argv)
 
     printf("  exponent p : %llu   (M_p = 2^%llu - 1, %llu bits, prime exponent)\n",
            (unsigned long long)p, (unsigned long long)p, (unsigned long long)p);
+    printf("  worktodo   : %s\n", cfg.worktodo_file.c_str());
     printf("  factor range: %s .. %s\n",
            u128_to_pow2(cfg.factor_min).c_str(), u128_to_pow2(cfg.factor_max).c_str());
     printf("               (%d-bit .. %d-bit candidates)\n",
@@ -2457,8 +2979,16 @@ static int run_main(int argc, char** argv)
                (unsigned long long)wh.classes.size(), (unsigned long long)wh.W,
                100.0 * wh.classes.size() / (double)wh.W);
     }
-    printf("  pre-sieve  : primes below %u%s\n", resolve_sieve_limit(cfg, p),
-           cfg.sieve_primes ? "" : "  (auto)");
+    {
+        const uint32_t lim = resolve_sieve_limit(cfg, p);
+        const uint32_t eff = effective_sieve_limit(cfg, p);
+        const char*    how = cfg.sieve_primes ? "" : "  (auto)";
+        if (eff < lim)
+            printf("  pre-sieve  : primes below %u%s, capped to %u by segment_size/8\n",
+                   lim, how, eff);
+        else
+            printf("  pre-sieve  : primes below %u%s\n", lim, how);
+    }
     printf("  arithmetic : narrowest exact kernel, chosen per bit level\n");
     printf("\n");
 
@@ -2472,9 +3002,15 @@ static int run_main(int argc, char** argv)
     printf("  pre-sieved : %llu removed before the GPU (%.1f%%)\n",
            (unsigned long long)(stats.k_scanned - stats.gpu_tested),
            stats.k_scanned ? 100.0 * (1.0 - (double)stats.gpu_tested / (double)stats.k_scanned) : 0.0);
-    printf("  GPU tested : %llu candidates in %.2f s (%.2f M/s)\n",
+    printf("  GPU tested : %llu candidates in %.2f s (%.2f M/s on the GPU)\n",
            (unsigned long long)stats.gpu_tested, stats.seconds,
            stats.seconds > 0 ? stats.gpu_tested / stats.seconds / 1e6 : 0.0);
+    // The headline rate, and the one the progress line shows: every candidate
+    // disposed of per second, sieved out or tested.  This is the figure to
+    // compare between runs -- the GPU-only rate above answers a narrower
+    // question and moves the wrong way when the sieve does more of the work.
+    printf("  overall    : %.2f M candidates/s disposed of (sieved or tested)\n",
+           stats.seconds > 0 ? stats.k_scanned / stats.seconds / 1e6 : 0.0);
     printf("\n");
 
     // Each factor was already announced in full (and logged) the moment it was

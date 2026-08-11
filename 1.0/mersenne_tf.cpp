@@ -581,10 +581,12 @@ struct Config {
 
 // sieve_primes = auto.  The best bound is where the CPU sieve and the GPU finish
 // together, so it tracks the GPU's cost per candidate, which is proportional to
-// bitlen(p) (the number of Montgomery squarings).  Measured on an RTX 3070 +
-// i7-12700KF: 500k is optimal for the 27-bit exponents GIMPS actually uses, and
-// the optimum drifts to ~1M for 60-bit exponents.  The curve is flat -- being
-// off by 4x costs under 10% -- so two brackets are plenty.
+// bitlen(p) (the number of Montgomery squarings).  The two brackets below came
+// from measurement on one machine and are a starting point, not a universal
+// optimum: the balance point moves with the ratio of CPU sieve speed to GPU
+// test speed.  Two brackets are enough because the curve is flat -- being off
+// by 4x costs only a few percent -- so a machine whose optimum differs loses
+// little by leaving this on auto.
 static uint32_t resolve_sieve_limit(const Config& cfg, uint64_t p)
 {
     if (cfg.sieve_primes) return cfg.sieve_primes;

@@ -538,8 +538,7 @@ within a window — see the note on measurement below.)
 
 200000 is now optimal, not 500000 — a faster kernel makes each surviving candidate
 cheaper, so paying CPU time to remove more of them stops being worth it. The shipped
-`config.txt` sets 200000 explicitly for this reason; `auto` has not been re-tuned
-(it is M4 in `tasks/todo.md`).
+`config.txt` sets 200000 explicitly for this reason; `auto` has not been re-tuned.
 
 The curve is still flat near the optimum — 100k to 300k spans 1.4% — so this is worth
 setting once and forgetting. Being badly wrong costs about 12%.
@@ -598,8 +597,7 @@ why the items only paid off together — with the sieve at 52 s, the 64-bit kern
   in all — and it measures 1.21x on the levels below 2^64 that it covers. Above 2^64 three
   limbs are unavoidable, and **Barrett does not help**: its reduction needs ~12 products
   against Montgomery's 9, so it is worse on the metric that matters. A 3-limb Karatsuba
-  square saves one product; beyond that, nothing cheap is left. Scoped in
-  `tasks/todo.md`. (Earlier versions of this section
+  square saves one product; beyond that, nothing cheap is left. (Earlier versions of this section
   blamed shorter carry chains, then Montgomery-vs-Barrett as an instruction-count
   argument, then carry propagation; the ablations above are what actually settled it.)
 * **Sieving on the GPU**, as mfaktc does with `SieveOnGPU=1`. Sending the sieve bitmap

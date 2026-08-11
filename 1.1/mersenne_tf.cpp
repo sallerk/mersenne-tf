@@ -1,5 +1,5 @@
 // ===========================================================================
-//  mersenne_tf0.9  --  GPU trial factoring of Mersenne numbers  M_p = 2^p - 1
+//  mersenne_tf 1.1  --  GPU trial factoring of Mersenne numbers  M_p = 2^p - 1
 // ===========================================================================
 //
 //  Finds every PRIME factor of M_p inside a user-chosen range of candidate
@@ -41,8 +41,13 @@
 //  so no prime factor can be lost to the sieve.
 //
 //  Build:  build.bat        (needs only Visual Studio; no CUDA/OpenCL SDK)
-//  Run:    mersenne_tf0.9.exe [--config config.txt] [--selftest] [--list-devices]
+//  Run:    mersenne_tf.exe [--config config.txt] [--selftest] [--list-devices]
 // ===========================================================================
+
+// The one place the release number lives.  Banner, usage text, GIMPS result
+// lines and the run log all derive from these, so they cannot drift apart.
+#define MTF_NAME    "mersenne_tf"
+#define MTF_VERSION "1.1"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -555,16 +560,22 @@ static int g_pause_mode = PAUSE_AUTO;      // read by main() on every exit path
 
 struct Config {
     int         pause_mode    = PAUSE_AUTO;
-    uint64_t    exponent      = 1277;
+    // The job itself lives in worktodo.txt, not here: config.txt is machine
+    // settings, worktodo.txt is what to work on, as GIMPS clients do it.
+    std::string worktodo_file = "worktodo.txt";
+    uint64_t    exponent      = 0;
     U128        factor_min    = u128_from(3);
     U128        factor_max    = u128_shl(u128_from(1), 40);
+    int         bit_lo        = 0;      // as written in worktodo, for reporting
+    int         bit_hi        = 0;
     uint32_t    sieve_primes  = 0;          // 0 = auto (resolve_sieve_limit)
     uint32_t    segment_size  = 1u << 22;
     int         threads       = 0;          // 0 = auto
     int         platform      = -1;         // -1 = auto
     int         device        = 0;
     bool        stop_on_factor = false;
-    std::string results_file  = "results.txt";
+    std::string results_file  = "results.txt";   // GIMPS submission lines only
+    std::string log_file      = "runlog.txt";    // human record of every run
     int         arithmetic    = 0;      // 0 = auto, 96 or 128 to force a kernel
     int         workgroup     = 0;      // 0 = ask the driver
     int         gpu_slots     = 3;      // batches in flight on the device
@@ -581,11 +592,37 @@ struct Config {
 // test speed.  Two brackets are enough because the curve is flat -- being off
 // by 4x costs only a few percent -- so a machine whose optimum differs loses
 // little by leaving this on auto.
+//
+// This is the bound the tuning asks for.  What the sieve can actually apply is
+// this limited by sieve_prime_cap_for() below, and the two are reported
+// separately so a bound that cannot take effect is visible rather than silent.
 static uint32_t resolve_sieve_limit(const Config& cfg, uint64_t p)
 {
     if (cfg.sieve_primes) return cfg.sieve_primes;
     int pbits = 0; { uint64_t t = p; while (t) { ++pbits; t >>= 1; } }
     return (pbits <= 32) ? 500000u : 1000000u;
+}
+
+// The largest prime a segment of `len` candidates will apply.  A prime only
+// earns its keep if the candidates it removes cost the GPU more than the setup
+// costs here; past about len/8 it strikes too few positions to be worth it,
+// which also stops tiny ranges paying for a huge prime table.
+//
+// The sieve loop and the run header both call this, so the bound that is
+// reported cannot drift from the bound that is used.
+static inline uint32_t sieve_prime_cap_for(uint32_t len)
+{
+    return (len > 8192) ? (len / 8) : 1024u;
+}
+
+// What a full-size segment applies: the configured bound, limited by the cap.
+// Short trailing segments cap lower still, so this is an upper bound on the
+// depth actually reached.
+static uint32_t effective_sieve_limit(const Config& cfg, uint64_t p)
+{
+    const uint32_t lim = resolve_sieve_limit(cfg, p);
+    const uint32_t cap = sieve_prime_cap_for(cfg.segment_size);
+    return (lim > cap) ? cap : lim;
 }
 
 static std::string trim(const std::string& s)
@@ -670,6 +707,118 @@ static bool parse_cfg_bool(const std::string& val, bool& out, std::string& err)
     return false;
 }
 
+// ---------------------------------------------------------------------------
+//  worktodo.txt -- what to work on.  Two accepted forms, first entry wins:
+//
+//     Factor=<assignment_id>,<exponent>,<bit_lo>,<bit_hi>
+//         The GIMPS assignment line, as PrimeNet hands it out and as mfaktc
+//         reads it.  Paste an assignment straight in.  The id may be anything
+//         (PrimeNet's 32-hex-digit key, or N/A when you have no assignment).
+//
+//     exponent   = 9147253
+//     factor_min = 1
+//     factor_max = 2^70
+//         The plain form, for a range that is not a whole bit level.
+//
+//  Bit levels are the natural unit here -- the search runs one at a time and
+//  reports each as it clears -- so the Factor= form is preferred.
+// ---------------------------------------------------------------------------
+static bool load_worktodo(const std::string& path, Config& cfg, std::string& err)
+{
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open '" + path + "' -- it holds the job to run"; return false; }
+
+    char line[1024];
+    int  lineno = 0;
+    bool have_exp = false, have_min = false, have_max = false;
+    while (fgets(line, sizeof(line), f)) {
+        ++lineno;
+        std::string s(line);
+        size_t hash = s.find_first_of("#;");
+        if (hash != std::string::npos) s = s.substr(0, hash);
+        s = trim(s);
+        if (s.empty()) continue;
+
+        std::string lower = s;
+        for (auto& c : lower) c = (char)tolower((unsigned char)c);
+
+        if (lower.rfind("factor=", 0) == 0) {
+            // Factor=<id>,<exponent>,<bit_lo>,<bit_hi>
+            std::vector<std::string> parts;
+            std::string rest = s.substr(7);
+            size_t pos = 0;
+            for (;;) {
+                size_t c = rest.find(',', pos);
+                parts.push_back(trim(rest.substr(pos, c == std::string::npos ? c : c - pos)));
+                if (c == std::string::npos) break;
+                pos = c + 1;
+            }
+            if (parts.size() < 4) {
+                fclose(f);
+                err = path + " line " + std::to_string(lineno) +
+                      ": expected Factor=<id>,<exponent>,<bit_lo>,<bit_hi>";
+                return false;
+            }
+            std::string perr;
+            U128 e;
+            if (!parse_u128(parts[1], e, perr) || e.hi != 0 || e.lo < 2) {
+                fclose(f); err = path + " line " + std::to_string(lineno) + ": bad exponent"; return false;
+            }
+            int lo = atoi(parts[2].c_str()), hi = atoi(parts[3].c_str());
+            if (lo < 0 || hi <= lo || hi > 127) {
+                fclose(f);
+                err = path + " line " + std::to_string(lineno) +
+                      ": bit levels must satisfy 0 <= bit_lo < bit_hi <= 127";
+                return false;
+            }
+            cfg.exponent   = e.lo;
+            cfg.bit_lo     = lo;
+            cfg.bit_hi     = hi;
+            cfg.factor_min = (lo == 0) ? u128_from(1) : u128_shl(u128_from(1), (unsigned)lo);
+            cfg.factor_max = u128_shl(u128_from(1), (unsigned)hi);
+            fclose(f);
+            return true;
+        }
+
+        size_t eq = s.find('=');
+        if (eq == std::string::npos) {
+            fclose(f);
+            err = path + " line " + std::to_string(lineno) + ": expected 'key = value' or 'Factor=...'";
+            return false;
+        }
+        std::string key = trim(lower.substr(0, eq)), val = trim(s.substr(eq + 1));
+        std::string perr;
+        if (key == "exponent" || key == "p") {
+            U128 v;
+            if (!parse_u128(val, v, perr) || v.hi != 0 || v.lo < 2) {
+                fclose(f); err = path + " line " + std::to_string(lineno) + ": bad exponent"; return false;
+            }
+            cfg.exponent = v.lo; have_exp = true;
+        } else if (key == "factor_min" || key == "min") {
+            if (!parse_u128(val, cfg.factor_min, perr)) {
+                fclose(f); err = path + " line " + std::to_string(lineno) + ": " + perr; return false;
+            }
+            have_min = true;
+        } else if (key == "factor_max" || key == "max") {
+            if (!parse_u128(val, cfg.factor_max, perr)) {
+                fclose(f); err = path + " line " + std::to_string(lineno) + ": " + perr; return false;
+            }
+            have_max = true;
+        } else {
+            fclose(f);
+            err = path + " line " + std::to_string(lineno) + ": unknown key '" + key +
+                  "' (worktodo holds the job; machine settings go in config.txt)";
+            return false;
+        }
+    }
+    fclose(f);
+    if (!have_exp || !have_min || !have_max) {
+        err = path + ": needs either a Factor= line or all of exponent/factor_min/factor_max";
+        return false;
+    }
+    return true;
+}
+
 static bool load_config(const std::string& path, Config& cfg, std::string& err)
 {
     FILE* f = fopen(path.c_str(), "rb");
@@ -699,15 +848,13 @@ static bool load_config(const std::string& path, Config& cfg, std::string& err)
         if (val.empty()) return fail(key + ": no value");
 
         std::string perr;
-        if (key == "exponent" || key == "p" || key == "mp") {
-            U128 v;
-            if (!parse_u128(val, v, perr)) return fail("bad exponent (" + perr + ")");
-            if (v.hi != 0)                 return fail("bad exponent (must fit in 64 bits)");
-            cfg.exponent = v.lo;
-        } else if (key == "factor_min" || key == "lower" || key == "min") {
-            if (!parse_u128(val, cfg.factor_min, perr)) return fail(key + ": " + perr);
-        } else if (key == "factor_max" || key == "upper" || key == "max") {
-            if (!parse_u128(val, cfg.factor_max, perr)) return fail(key + ": " + perr);
+        if (key == "exponent" || key == "p" || key == "mp" ||
+            key == "factor_min" || key == "lower" || key == "min" ||
+            key == "factor_max" || key == "upper" || key == "max") {
+            return fail("'" + key + "' has moved to worktodo.txt (see that file for the\n"
+                        "        format).  config.txt is machine settings only.");
+        } else if (key == "worktodo_file") {
+            cfg.worktodo_file = val;
         } else if (key == "sieve_primes") {
             if (val == "auto") cfg.sieve_primes = 0u;
             else if (!parse_cfg_uint(val, 2, 1000000000u, cfg.sieve_primes, perr)) return fail(key + ": " + perr);
@@ -723,6 +870,8 @@ static bool load_config(const std::string& path, Config& cfg, std::string& err)
             if (!parse_cfg_bool(val, cfg.stop_on_factor, perr)) return fail(key + ": " + perr);
         } else if (key == "results_file") {
             cfg.results_file = val;
+        } else if (key == "log_file") {
+            cfg.log_file = val;
         } else if (key == "workgroup") {
             if (!parse_cfg_int(val, 0, 65536, cfg.workgroup, perr)) return fail(key + ": " + perr);
         } else if (key == "gpu_slots") {
@@ -1310,6 +1459,9 @@ static void check_small_primes_in_range(uint64_t p, U128 fmin, U128 fmax,
 //  plus one line appended to the results file.  Nothing here is taken from the
 //  GPU on trust -- every field is recomputed on the CPU.
 // ---------------------------------------------------------------------------
+// Identifies the program in GIMPS result lines, as mfaktc's version string does.
+#define TF_PROGRAM_ID MTF_NAME " " MTF_VERSION
+
 static void report_factor(uint64_t p, U128 q, const Config& cfg)
 {
     bool verified = u128_eq(h_pow2_mod(p, q), u128_from(1));
@@ -1327,16 +1479,18 @@ static void report_factor(uint64_t p, U128 q, const Config& cfg)
     printf("      2^p mod q = 1 : %s  (recomputed on the CPU)\n", verified ? "VERIFIED" : "*** FAILED ***");
     printf("      q is      : %s\n", pl);
 
+    // GIMPS manual-submission format.  Paste results.txt straight into
+    // https://www.mersenne.org/manual_result/ -- these are the exact lines that
+    // page parses, so nothing has to be reformatted by hand.
     FILE* rf = fopen(cfg.results_file.c_str(), "a");
     if (rf) {
-        SYSTEMTIME lt; GetLocalTime(&lt);
-        fprintf(rf, "%04d-%02d-%02d %02d:%02d:%02d  p=%llu  q=%s  k=%s  bits=%d  %s  %s\n",
-                lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond,
-                (unsigned long long)p, u128_to_dec(q).c_str(), u128_to_dec(kq).c_str(),
-                u128_bitlen(q), verified ? "verified" : "VERIFY-FAILED", pl);
+        fprintf(rf, "M%llu has a factor: %s [TF:%d:%d:%s]\n",
+                (unsigned long long)p, u128_to_dec(q).c_str(),
+                cfg.bit_lo, cfg.bit_hi, TF_PROGRAM_ID);
         fclose(rf);
         printf("      logged to : %s\n", cfg.results_file.c_str());
     }
+    if (!verified) printf("      *** NOT logged as verified -- CPU check failed ***\n");
     printf("\n");
     fflush(stdout);
 }
@@ -1381,6 +1535,10 @@ struct Level {
     U128 qhi_excl;
     U128 qhi_disp;          // what to print as the upper end
     U128 candidates;        // k on the wheel inside this level
+    int  bit_lo, bit_hi;    // the level as GIMPS names it: 2^bit_lo .. 2^bit_hi
+    bool full;              // false when the range stops inside this level, in
+                            // which case it is NOT a cleared bit level and must
+                            // not be reported to GIMPS as one
 };
 
 static std::vector<Level> build_levels(uint64_t p, const Wheel& wh, U128 fmin, U128 fmax,
@@ -1392,6 +1550,8 @@ static std::vector<Level> build_levels(uint64_t p, const Wheel& wh, U128 fmin, U
     if (u128_lt(kmax, kmin)) return out;
 
     U128 klo = kmin, qlo = fmin;
+    int prev_e = u128_bitlen(fmin) - 1;               // where this range starts
+    if (prev_e < 0) prev_e = 0;
     for (int e = 40; e <= 127; ++e) {
         if (e > 40 && e < 50) continue;               // below 2^60 the levels are
         if (e > 50 && e < 60) continue;               // decades, not single bits
@@ -1410,10 +1570,14 @@ static std::vector<Level> build_levels(uint64_t p, const Wheel& wh, U128 fmin, U
         L.qhi_excl = truncated ? u128_add(fmax, ONE) : V;
         L.qhi_disp = truncated ? fmax : V;
         L.candidates = wheel_k_count(wh, klo, khi);
+        L.bit_lo = prev_e;
+        L.bit_hi = e;
+        L.full   = !truncated;
         if (!u128_is_zero(L.candidates)) out.push_back(L);   // empty level: nothing to scan
 
         klo = u128_add(khi, ONE);
         qlo = V;
+        prev_e = e;
         if (u128_gt(klo, kmax)) break;
     }
     return out;
@@ -1442,15 +1606,16 @@ static void log_level(const Config& cfg, uint64_t p, const Level& L,
            level_label(L).c_str(), u128_to_dec(L.candidates).c_str(), nf);
     fflush(stdout);
 
-    FILE* rf = fopen(cfg.results_file.c_str(), "a");
-    if (!rf) { printf("  ! could not write to %s\n", cfg.results_file.c_str()); return; }
-    SYSTEMTIME lt; GetLocalTime(&lt);
-    fprintf(rf, "%04d-%02d-%02d %02d:%02d:%02d  p=%llu  level=%s..%s  status=complete"
-                "  factors=%d  candidates=%s\n",
-            lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond,
-            (unsigned long long)p, u128_to_pow2(L.qlo).c_str(),
-            u128_to_pow2(L.qhi_disp).c_str(), nf, u128_to_dec(L.candidates).c_str());
-    fclose(rf);
+    // One GIMPS "no factor" line per bit level, written as the level clears.
+    // A level that found something is covered by its "has a factor" line, so it
+    // is not also reported clean.
+    if (nf == 0 && L.full) {
+        FILE* rf = fopen(cfg.results_file.c_str(), "a");
+        if (!rf) { printf("  ! could not write to %s\n", cfg.results_file.c_str()); return; }
+        fprintf(rf, "no factor for M%llu from 2^%d to 2^%d [%s]\n",
+                (unsigned long long)p, L.bit_lo, L.bit_hi, TF_PROGRAM_ID);
+        fclose(rf);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1463,9 +1628,9 @@ static void log_level(const Config& cfg, uint64_t p, const Level& L,
 static void report_run(uint64_t p, const Config& cfg,
                        const std::vector<U128>& factors, const RunStats& stats)
 {
-    FILE* rf = fopen(cfg.results_file.c_str(), "a");
+    FILE* rf = fopen(cfg.log_file.c_str(), "a");
     if (!rf) {
-        printf("  ! could not write the run record to %s\n", cfg.results_file.c_str());
+        printf("  ! could not write the run record to %s\n", cfg.log_file.c_str());
         fflush(stdout);
         return;
     }
@@ -1484,7 +1649,7 @@ static void report_run(uint64_t p, const Config& cfg,
             (int)factors.size(),
             (unsigned long long)stats.k_scanned, (unsigned long long)stats.gpu_tested, tbuf);
     fclose(rf);
-    printf("          run recorded in %s\n", cfg.results_file.c_str());
+    printf("          run recorded in %s\n", cfg.log_file.c_str());
     fflush(stdout);
 }
 
@@ -1855,11 +2020,11 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
 
                         // ---- pre-factoring: strike out every k whose q has a
                         //      small prime factor -------------------------------
-                        //  A prime only earns its keep if the candidates it removes
-                        //  cost the GPU more than the setup costs here; past about
-                        //  len/8 it strikes too few positions to be worth it, which
-                        //  also stops tiny ranges paying for a huge prime table.
-                        const uint32_t pcap = (len > 8192) ? (len / 8) : 1024u;
+                        //  Primes above the segment's cap are skipped -- see
+                        //  sieve_prime_cap_for().  The run header reports the same
+                        //  cap, so a sieve_primes the segment cannot reach is
+                        //  visible up front rather than silently ignored.
+                        const uint32_t pcap = sieve_prime_cap_for(len);
 
                         // First strike position for each prime, once per segment.
                         size_t np = 0;
@@ -2345,7 +2510,7 @@ static bool selftest(Gpu& g, Config cfg)
 static void banner()
 {
     printf("=======================================================================\n");
-    printf(" mersenne_tf0.9  --  GPU trial factoring of M_p = 2^p - 1  (exact 128-bit)\n");
+    printf(" " MTF_NAME " " MTF_VERSION "  --  GPU trial factoring of M_p = 2^p - 1  (exact 128-bit)\n");
     printf("=======================================================================\n");
 }
 
@@ -2364,7 +2529,7 @@ static int run_main(int argc, char** argv)
         else if (a == "--list-devices")           do_list = true;
         else if (a == "--help" || a == "-h") {
             banner();
-            printf("\nusage: mersenne_tf0.9 [--config FILE] [--selftest] [--list-devices]\n\n"
+            printf("\nusage: " MTF_NAME ".exe [--config FILE] [--selftest] [--list-devices]\n\n"
                    "  Reads the exponent and the factor bounds from a plain text config\n"
                    "  file (default config.txt).  See README.md.\n");
             return 0;
@@ -2388,6 +2553,16 @@ static int run_main(int argc, char** argv)
         printf("\nERROR: %s\n", err.c_str());
         if (!do_selftest) return 1;
         cfg = Config();
+    }
+    // The job lives in worktodo.txt.  The self test brings its own cases, so it
+    // runs without one; every other mode needs it.
+    if (!do_selftest && !do_bench) {
+        if (!load_worktodo(cfg.worktodo_file, cfg, err)) {
+            printf("\nERROR: %s\n", err.c_str());
+            return 1;
+        }
+    } else if (cfg.exponent == 0) {
+        cfg.exponent = 1277;                  // harmless default for --bench
     }
     g_pause_mode = cfg.pause_mode;
     if (cfg.segment_size < 4096) cfg.segment_size = 4096;
@@ -2445,6 +2620,7 @@ static int run_main(int argc, char** argv)
 
     printf("  exponent p : %llu   (M_p = 2^%llu - 1, %llu bits, prime exponent)\n",
            (unsigned long long)p, (unsigned long long)p, (unsigned long long)p);
+    printf("  worktodo   : %s\n", cfg.worktodo_file.c_str());
     printf("  factor range: %s .. %s\n",
            u128_to_pow2(cfg.factor_min).c_str(), u128_to_pow2(cfg.factor_max).c_str());
     printf("               (%d-bit .. %d-bit candidates)\n",
@@ -2457,8 +2633,16 @@ static int run_main(int argc, char** argv)
                (unsigned long long)wh.classes.size(), (unsigned long long)wh.W,
                100.0 * wh.classes.size() / (double)wh.W);
     }
-    printf("  pre-sieve  : primes below %u%s\n", resolve_sieve_limit(cfg, p),
-           cfg.sieve_primes ? "" : "  (auto)");
+    {
+        const uint32_t lim = resolve_sieve_limit(cfg, p);
+        const uint32_t eff = effective_sieve_limit(cfg, p);
+        const char*    how = cfg.sieve_primes ? "" : "  (auto)";
+        if (eff < lim)
+            printf("  pre-sieve  : primes below %u%s, capped to %u by segment_size/8\n",
+                   lim, how, eff);
+        else
+            printf("  pre-sieve  : primes below %u%s\n", lim, how);
+    }
     printf("  arithmetic : narrowest exact kernel, chosen per bit level\n");
     printf("\n");
 

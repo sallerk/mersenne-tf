@@ -1,0 +1,26 @@
+# ===========================================================================
+#  worktodo.txt -- what to work on.
+#
+#  The program reads the first entry here.  config.txt holds machine settings
+#  (which GPU, how many threads); this file holds the job, the way GIMPS
+#  clients split it.
+#
+#  PREFERRED FORM -- a PrimeNet assignment, pasted as-is:
+#
+#      Factor=<assignment_id>,<exponent>,<bit_lo>,<bit_hi>
+#
+#  It means: trial factor M_exponent from 2^bit_lo to 2^bit_hi.  The id can be
+#  the 32-hex-digit key PrimeNet gives you, or N/A if you have no assignment.
+#  Results are written in the format the manual submission page expects, so a
+#  completed level can be pasted straight back.
+#
+#  PLAIN FORM -- for a range that is not a whole bit level:
+#
+#      exponent   = 9147253
+#      factor_min = 1
+#      factor_max = 2^70
+#
+#  Lines starting with # or ; are comments.
+# ===========================================================================
+
+Factor=N/A,9147253,65,66

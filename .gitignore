@@ -15,6 +15,9 @@ checkpoint_*.txt
 tasks/
 LESSONS_LEARNED.md
 
+# agent scratch: .claude/worktrees holds whole checkouts of this repo
+.claude/
+
 # editor / OS cruft
 .vs/
 *.user

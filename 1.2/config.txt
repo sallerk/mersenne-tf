@@ -1,5 +1,5 @@
 # ===========================================================================
-#  mersenne_tf 1.0 -- machine settings.
+#  mersenne_tf 1.2 -- machine settings.
 #
 #  WHAT TO WORK ON LIVES IN worktodo.txt, not here.  This file is settings for
 #  this machine: which GPU, how many sieve threads, where results go.  Keeping
@@ -32,28 +32,49 @@ worktodo_file = worktodo.txt
 #  more CPU work per candidate; the best value is where the CPU sieve and the
 #  GPU finish at the same rate.
 #
-#  "auto" picks it from the size of the exponent (500000 for exponents up to
-#  32 bits, 1000000 above), which is what the measured optima came out at -- see
-#  README, "Tuning".  The curve is flat: being off by 4x costs under 10%, so
+#  "auto" picks it from the size of the exponent and from where the sieve runs:
+#  120000 / 250000 on the device, 500000 / 1000000 on the CPU (the lower of each
+#  pair for exponents up to 32 bits).  The device wants roughly half as deep,
+#  because there both the sieve and the test compete for the same GPU, whereas a
+#  CPU sieve overlaps with the GPU and is nearly free.  The curve is flat, so
 #  there is little to gain by hand-tuning unless you are benchmarking.
 #  (Sieve primes that fall inside your range are tested directly, so raising
 #   this can never hide a factor.)
 #
-#  Range: auto, or 2 .. 1000000000.
+#  CEILING.  A prime that strikes fewer than about one position in eight of a
+#  segment does not remove enough candidates to pay for its own setup, so the
+#  sieve stops at segment_size/8 and this value is limited to that.  At the
+#  default segment_size = 4194304 the ceiling is 524288: anything above it has
+#  no effect except the cost of building a larger prime table.  The run header
+#  says so when it applies --
+#      pre-sieve  : primes below 1000000, capped to 524288 by segment_size/8
+#  -- and "auto" above 32 bits asks for 1000000, so it meets that ceiling.
+#  Raising segment_size raises the ceiling, but measurement says that is a bad
+#  trade: letting those primes through removes a few percent more candidates and
+#  costs appreciably more wall time.  The ceiling is there for that reason, not
+#  as something to tune around.
+#
+#  Range: auto, or 2 .. 1000000000, effective value limited to segment_size/8.
 # ---------------------------------------------------------------------------
-#  TUNING IT.  The best value depends on how fast your CPU sieves relative to
-#  how fast your GPU tests, so it differs between machines -- the shipped
-#  default came from the machine this was developed on and is a starting point,
-#  not a universal optimum.  To find yours, time one bit level at a few values
-#  and keep the fastest; the M/s on the progress line counts every candidate
-#  disposed of, so it is directly comparable between them.
+#  TUNING IT.  The best value depends on how fast your machine sieves relative
+#  to how fast it tests, so it differs between machines -- the shipped default
+#  came from the machine this was developed on and is a starting point, not a
+#  universal optimum.  It also depends on the `sieve` setting below: moving the
+#  sieve onto the device roughly halves it, because there the two sides compete
+#  for the same GPU instead of overlapping.  To find yours, time one bit level
+#  at a few values and keep the fastest; the M/s on the progress line counts
+#  every candidate disposed of, so it is directly comparable between them.
 #
 #  Expect a flat curve near the optimum -- being off by a factor of a few costs
 #  only a few percent -- and a steep penalty for sieving far too shallow, since
 #  every prime you skip hands the GPU candidates it need not have tested.
 #  Sieving deeper than the optimum costs less, but still costs.
 #  The measurements behind the shipped default are in CHANGELOG.md.
-sieve_primes = 200000
+#  Since 1.2 the M/s on the progress line counts every candidate disposed of,
+#  sieved or tested, so it moves the same way as the wall time and can be
+#  compared across sieve depths.  (Up to 1.1 it counted GPU arrivals only and
+#  fell as the sieve improved, which made it useless for exactly this job.)
+sieve_primes = 120000
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +94,46 @@ sieve_primes = 200000
 checkpoint         = 1
 checkpoint_file    = auto
 checkpoint_seconds = 30
+
+
+# ---------------------------------------------------------------------------
+#  WHERE THE SIEVE RUNS.
+#    gpu  pre-factoring happens on the device: the bitmap is marked, compacted
+#         and consumed without the candidate list ever crossing PCIe, and the
+#         CPU does nothing per candidate.  This is what 1.2 added.
+#    cpu  the 1.1 pipeline: mark on the CPU, pack survivors into pinned memory,
+#         upload four bytes each.  Kept as the reference implementation -- the
+#         two produce bit-for-bit identical survivor sets (verified over 89.1e9
+#         candidates at sieve_primes = 50000, where the segment_size/8 ceiling
+#         below cannot bind and both paths therefore use the same primes).
+#
+#  In testing gpu is the faster of the two, and because it uses almost no CPU
+#  per candidate it is far less affected by whatever else the machine is doing.
+#  It is not yet as fast as it should be: removing the transfers lifted the
+#  trial-factoring rate substantially, but the sieve kernels themselves still
+#  cost more than a well-tuned implementation needs.  Figures, and three
+#  optimisations that looked certain and measured no better, are in CHANGELOG.md.
+#
+#  Note the ceiling documented under sieve_primes is a CPU-cost heuristic and
+#  applies to `cpu` only; the device path applies every prime on every segment,
+#  which is why its survivor counts are very slightly lower at large
+#  sieve_primes.  It removes more composites, never fewer.
+# ---------------------------------------------------------------------------
+sieve = gpu
+
+
+# ---------------------------------------------------------------------------
+#  CANDIDATES PER WORK ITEM.
+#    auto  2 where a vectorised kernel exists (the 72- and 96-bit paths)
+#    1     one candidate per thread
+#    2     two independent candidates interleaved in one thread
+#
+#  A single candidate is one serial dependency chain -- every squaring needs the
+#  previous result -- so a 1-wide kernel waits on latency rather than running
+#  short of work.  Measured worth 2.8% when the GPU is the constraint and 0.6%
+#  when it is not; set it to 1 only to compare.
+# ---------------------------------------------------------------------------
+vector = auto
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +162,15 @@ arithmetic = auto
 #                  the pool falls back to its 3-buffer minimum and the pipeline
 #                  starves -- measured at well under half the throughput of
 #                  2^21..2^23.
+#                  Those figures are for sieve = cpu.  The device sieve wants a
+#                  much larger segment, because it launches several kernels per
+#                  segment and small segments pay that overhead over and over,
+#                  while very large ones spill the index buffers out of GPU
+#                  memory.  2^24 measured best; see CHANGELOG.md.
+#                  It also sets the CPU sieve's ceiling: no prime above
+#                  segment_size/8 is applied there, so at 2^24 that ceiling is
+#                  2097152 -- above any sensible sieve_primes, so it no longer
+#                  binds.  (At the old 2^22 default it was 524288 and did.)
 #                  Range 4096 .. 2^28.
 #    threads       CPU sieve threads, 0 = auto (cores - 1).  Range 0 .. 4096.
 #    workgroup     GPU work-group size, 0 = ask the driver.  Measured flat from
@@ -110,7 +180,7 @@ arithmetic = auto
 #    platform      OpenCL platform index, -1 = auto     (--list-devices)
 #    device        OpenCL device index on that platform, 0 or above
 # ---------------------------------------------------------------------------
-segment_size = 4194304
+segment_size = 16777216
 threads      = 0
 workgroup    = 0
 gpu_slots    = 3

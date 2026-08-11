@@ -1,4 +1,4 @@
-# mersenne_tf 1.0 — GPU trial factoring of Mersenne numbers
+# mersenne_tf 1.1 — GPU trial factoring of Mersenne numbers
 
 Finds every **prime factor of `M_p = 2^p - 1`** inside a range you choose, using your GPU,
 with **exact integer arithmetic** — no floating point anywhere in the number theory.
@@ -11,6 +11,13 @@ work can be pasted straight back.
 
 > Measurements, and the reasoning behind every default, are in
 > [`CHANGELOG.md`](../CHANGELOG.md). This file is the manual.
+
+**New in 1.1** — reporting and documentation only; results are bit-for-bit identical to 1.0.
+The sieve silently stopped at `segment_size/8` while the header claimed whatever
+`sieve_primes` said, so a configured `1000000` was really `524288` and nothing said so. The
+header now reports the effective bound, and the `M/s` figure is documented as what it
+actually is: candidates *reaching* the GPU, which a deeper sieve is meant to reduce. Full
+list in [`CHANGELOG.md`](../CHANGELOG.md).
 
 ---
 
@@ -91,6 +98,11 @@ While it runs, one line is rewritten in place:
   of work that finishes and gets reported. Resuming picks it up where it left off.
 - **`ETA`** is for this level; **`job`** is the whole configured range.
 - **`cls`** is the wheel class within the level. Level plus class is the resume point.
+- **`M/s` counts candidates that reached the GPU**, so it is only comparable between runs
+  at the same `sieve_primes`. Sieving deeper is *supposed* to lower it — that is the work
+  being removed. Across sieve depths, compare `elapsed`, not the rate: at `p = 86000009`
+  over `2^66..2^67`, dropping `sieve_primes` from `200000` to `17000` raises the rate from
+  1750 to 1830 M/s and makes the level take 19% longer, because 25% more candidates survive.
 
 The line is built to your console's width and never wraps; on a narrow window it drops the
 least important fields rather than spilling onto a second line.
@@ -102,13 +114,19 @@ least important fields rather than spilling onto a second line.
 Only lines the [manual submission page](https://www.mersenne.org/manual_result/) parses:
 
 ```
-M9147253 has a factor: 313603386094415369 [TF:64:65:mersenne_tf 1.0]
-no factor for M9147253 from 2^64 to 2^65 [mersenne_tf 1.0]
+M9147253 has a factor: 313603386094415369 [TF:64:65:mersenne_tf 1.1]
+no factor for M9147253 from 2^64 to 2^65 [mersenne_tf 1.1]
 ```
 
 A `no factor` line is written **as each bit level clears**, so a run stopped part way still
 submits everything it finished. A level your range only partly covers is deliberately *not*
 reported — that claim belongs to whoever finishes it.
+
+Above `2^60` a level is one bit. Below it the levels are decades — `<2^40`, `2^40..2^50`,
+`2^50..2^60` — so a job like `Factor=N/A,9147253,58,59` is scanned in full but counts as
+part of the `2^50..2^60` level and produces no `no factor` line. Ask for `50,60` if you
+want that range claimed. This only ever withholds a true claim, never makes a false one,
+and GIMPS assignments do not reach that far down.
 
 ### `runlog.txt` — for you
 
@@ -161,7 +179,7 @@ The ones worth knowing:
 | key | meaning |
 |---|---|
 | `worktodo_file` | where to read the job from (default `worktodo.txt`) |
-| `sieve_primes` | pre-factoring bound. `200000` measured best here; `auto` scales it from the exponent |
+| `sieve_primes` | pre-factoring bound. `200000` measured best here; `auto` scales it from the exponent. Capped at `segment_size/8` (524288 by default) — the run header says so when the cap bites |
 | `arithmetic` | `auto` picks the narrowest exact kernel per bit level; force `64`/`72`/`96`/`128` to compare |
 | `threads` | CPU sieve threads, `0` = auto (cores − 1) |
 | `platform`, `device` | which GPU (see `--list-devices`), `-1` = auto |

@@ -1,38 +1,27 @@
 # ===========================================================================
-#  mersenne_tf0.9 configuration
+#  mersenne_tf 1.1 -- machine settings.
 #
-#  Everything the program needs is in this file.  Lines starting with # are
-#  comments.  Every value may be written as plain decimal (1234567), with digit
-#  separators (1_234_567), or as a power of two (2^90, 2^90-1).
+#  WHAT TO WORK ON LIVES IN worktodo.txt, not here.  This file is settings for
+#  this machine: which GPU, how many sieve threads, where results go.  Keeping
+#  them apart means a worktodo can be swapped, or handed to another machine,
+#  without disturbing anything tuned for this one.
+#
+#  Lines starting with # are comments.  Every value may be written as plain
+#  decimal (1234567), with digit separators (1_234_567), or as a power of two
+#  (2^90, 2^90-1).
 #
 #  Values are checked when the file is read.  A number that does not parse, or
 #  one outside the range its key accepts, stops the program with the offending
-#  line number instead of quietly falling back to a default -- so a slipped
-#  keystroke ("50O000") cannot turn into a run you did not ask for.  The
-#  accepted range is listed with each key below.
+#  line number rather than quietly falling back to a default.  The accepted
+#  range is listed with each key below.
 # ===========================================================================
 
 
 # ---------------------------------------------------------------------------
-#  THE MERSENNE NUMBER.
-#  M_p = 2^p - 1.  p must be PRIME (for composite p the factor form 2kp+1 does
-#  not hold, and 2^p-1 is composite anyway).  M_p is never built in memory, so
-#  p may be as large as you like -- 1277, 82589933, 136279841, ...
+#  THE JOB FILE.
+#  Where to read the assignment from.  See worktodo.txt for its format.
 # ---------------------------------------------------------------------------
-exponent   =  9147253
-
-
-# ---------------------------------------------------------------------------
-#  THE FACTOR SEARCH RANGE.
-#  Every prime factor of M_p inside [factor_min, factor_max] will be found.
-#  Upper limit of the arithmetic is 2^127-1.
-#
-#  Examples:   factor_min = 2^70      factor_max = 2^71
-#              factor_min = 3         factor_max = 2^40
-#              factor_min = 1000000   factor_max = 999999999999
-# ---------------------------------------------------------------------------
-factor_min = 1
-factor_max = 2^70
+worktodo_file = worktodo.txt
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +39,20 @@ factor_max = 2^70
 #  (Sieve primes that fall inside your range are tested directly, so raising
 #   this can never hide a factor.)
 #
-#  Range: auto, or 2 .. 1000000000.
+#  CEILING.  A prime that strikes fewer than about one position in eight of a
+#  segment does not remove enough candidates to pay for its own setup, so the
+#  sieve stops at segment_size/8 and this value is limited to that.  At the
+#  default segment_size = 4194304 the ceiling is 524288: anything above it has
+#  no effect except the cost of building a larger prime table.  The run header
+#  says so when it applies --
+#      pre-sieve  : primes below 1000000, capped to 524288 by segment_size/8
+#  -- and "auto" above 32 bits asks for 1000000, so it meets that ceiling.
+#  Raising segment_size raises the ceiling, but measurement says that is a bad
+#  trade: letting those primes through removes a few percent more candidates and
+#  costs appreciably more wall time.  The ceiling is there for that reason, not
+#  as something to tune around.
+#
+#  Range: auto, or 2 .. 1000000000, effective value limited to segment_size/8.
 # ---------------------------------------------------------------------------
 #  TUNING IT.  The best value depends on how fast your CPU sieves relative to
 #  how fast your GPU tests, so it differs between machines -- the shipped
@@ -64,6 +66,9 @@ factor_max = 2^70
 #  every prime you skip hands the GPU candidates it need not have tested.
 #  Sieving deeper than the optimum costs less, but still costs.
 #  The measurements behind the shipped default are in CHANGELOG.md.
+#  Note that the rate in M/s moves the *opposite* way -- it counts candidates
+#  that reach the GPU, so a shallower sieve reads faster while taking longer.
+#  Compare wall time, not the rate.
 sieve_primes = 200000
 
 
@@ -112,6 +117,10 @@ arithmetic = auto
 #                  the pool falls back to its 3-buffer minimum and the pipeline
 #                  starves -- measured at well under half the throughput of
 #                  2^21..2^23.
+#                  It also sets the sieve's ceiling: no prime above
+#                  segment_size/8 is applied, so the default caps sieve_primes
+#                  at 524288.  Raising it to lift that ceiling measured worse
+#                  on both counts -- see sieve_primes above.
 #                  Range 4096 .. 2^28.
 #    threads       CPU sieve threads, 0 = auto (cores - 1).  Range 0 .. 4096.
 #    workgroup     GPU work-group size, 0 = ask the driver.  Measured flat from
@@ -132,22 +141,19 @@ device       = 0
 # ---------------------------------------------------------------------------
 #  OUTPUT.
 #    stop_on_factor  1 = stop as soon as a factor is found, 0 = scan it all
-#    results_file    the run log.  One line per factor as it is found, plus one
-#                    end-of-run line for EVERY run -- including a run that found
-#                    nothing, which is the usual outcome and is exactly the fact
-#                    worth keeping ("this range is clean" vs "never searched").
-#                    An interrupted run is recorded as status=interrupted, since
-#                    it only cleared part of the range.
-#
-#                    The search runs one bit level at a time -- below 2^40, then
-#                    2^40..2^50, 2^50..2^60, and every power of two above -- and
-#                    logs a "level=" line the moment each one is cleared, with
-#                    its candidate count and the factors found in it.  That is
-#                    how trial factoring is normally quoted ("cleared to 2^70"),
-#                    so the log compares directly with anyone else's.  A run
-#                    stopped part way keeps every level it did finish; the level
-#                    it was inside is simply absent, never half-claimed.  The
-#                    candidate counts add up to the run line's scanned total.
+#    results_file    GIMPS manual-submission lines, and nothing else, so the
+#                    file can be pasted straight into
+#                    https://www.mersenne.org/manual_result/ :
+#                        M9147253 has a factor: 313603386094415369 [TF:64:65:...]
+#                        no factor for M9147253 from 2^64 to 2^65 [...]
+#                    A "no factor" line is written as each bit level clears, so
+#                    a run stopped part way still submits what it finished.  A
+#                    level the range only partly covers is NOT reported -- that
+#                    claim belongs to whoever finishes it.
+#    log_file        the human record: one line per run including interrupted
+#                    ones, with status, candidate counts and timings.  This is
+#                    the file to read when you want to know what happened; it is
+#                    kept separate so results.txt stays machine-parseable.
 #    pause_on_exit   auto   = wait for Enter only when double-clicked (default)
 #                    always = always wait for Enter before closing
 #                    never  = never wait (for scripts / batch jobs)
@@ -157,4 +163,5 @@ device       = 0
 # ---------------------------------------------------------------------------
 stop_on_factor = 0
 results_file   = results.txt
+log_file       = runlog.txt
 pause_on_exit  = auto

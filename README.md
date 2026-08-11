@@ -4,13 +4,17 @@ GPU trial factoring of Mersenne numbers, `M_p = 2^p - 1`, with exact integer ari
 
 | version | |
 |---|---|
-| [**1.0**](1.0/) | current. Job lives in `worktodo.txt`; results are written in GIMPS manual-submission format. Start here — see [1.0/README.md](1.0/README.md). |
-| [0.9](0.9/) | previous. Job and settings both in `config.txt`; results in its own format. Kept as-is. |
+| [**1.2**](1.2/) | current. Sieves on the GPU — the whole pipeline is device-side. Start here — see [1.2/README.md](1.2/README.md). |
+| [1.1](1.1/) | previous. Reports the sieve bound it actually applies, not the one you asked for. Kept as-is. |
+| [1.0](1.0/) | job moved to `worktodo.txt`; results in GIMPS manual-submission format. Kept as-is. |
+| [0.9](0.9/) | job and settings both in `config.txt`; results in its own format. Kept as-is. |
+
+What changed between them is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 
 ```bash
-cd 1.0
+cd 1.2
 build.bat
 mersenne_tf.exe --selftest
 mersenne_tf.exe

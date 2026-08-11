@@ -1,4 +1,4 @@
-# mersenne_tf 1.0 — GPU trial factoring of Mersenne numbers
+# mersenne_tf 1.2 — GPU trial factoring of Mersenne numbers
 
 Finds every **prime factor of `M_p = 2^p - 1`** inside a range you choose, using your GPU,
 with **exact integer arithmetic** — no floating point anywhere in the number theory.
@@ -11,6 +11,11 @@ work can be pasted straight back.
 
 > Measurements, and the reasoning behind every default, are in
 > [`CHANGELOG.md`](../CHANGELOG.md). This file is the manual.
+
+**New in 1.2** — the sieve runs on the GPU. 1.1 and earlier pre-factored candidates on
+the CPU and uploaded the survivors; the whole pipeline is now device-side, and the 72-bit
+kernel tests two candidates per work item. Set `sieve = cpu` to get the old path back for
+comparison. Full list in [`CHANGELOG.md`](../CHANGELOG.md).
 
 ---
 
@@ -83,7 +88,7 @@ mersenne_tf.exe
 While it runs, one line is rewritten in place:
 
 ```
-  2^64..2^65  15.48%  6953609162 tested (1069 M/s)  cls 129-160/960  sieved 79.3%  elapsed 7s  ETA 5s  job 47m59s
+  2^64..2^65  15.48%  6953609162 done (4832 M/s)  cls 129-160/960  sieved 79.3%  elapsed 7s  ETA 5s  job 47m59s
 ```
 
 - **`2^64..2^65`** — the bit level being scanned. The bottom one reads `<2^40`.
@@ -91,6 +96,13 @@ While it runs, one line is rewritten in place:
   of work that finishes and gets reported. Resuming picks it up where it left off.
 - **`ETA`** is for this level; **`job`** is the whole configured range.
 - **`cls`** is the wheel class within the level. Level plus class is the resume point.
+- **`done` and `M/s` count every candidate disposed of** — sieved out *or* tested on the
+  GPU — not just the ones that reached the GPU. That makes the rate a measure of progress
+  and comparable between runs at different `sieve_primes`. Up to 1.1 it counted only GPU
+  arrivals, which moved the wrong way: sieving deeper removes candidates instead of testing
+  them, so the rate fell exactly when the job got faster.
+- **`sieved`** is the share the pre-factoring removed, so `done x (1 - sieved)` is what the
+  GPU actually tested. The end-of-run summary reports both rates separately.
 
 The line is built to your console's width and never wraps; on a narrow window it drops the
 least important fields rather than spilling onto a second line.
@@ -102,13 +114,19 @@ least important fields rather than spilling onto a second line.
 Only lines the [manual submission page](https://www.mersenne.org/manual_result/) parses:
 
 ```
-M9147253 has a factor: 313603386094415369 [TF:64:65:mersenne_tf 1.0]
-no factor for M9147253 from 2^64 to 2^65 [mersenne_tf 1.0]
+M9147253 has a factor: 313603386094415369 [TF:64:65:mersenne_tf 1.2]
+no factor for M9147253 from 2^64 to 2^65 [mersenne_tf 1.2]
 ```
 
 A `no factor` line is written **as each bit level clears**, so a run stopped part way still
 submits everything it finished. A level your range only partly covers is deliberately *not*
 reported — that claim belongs to whoever finishes it.
+
+Above `2^60` a level is one bit. Below it the levels are decades — `<2^40`, `2^40..2^50`,
+`2^50..2^60` — so a job like `Factor=N/A,9147253,58,59` is scanned in full but counts as
+part of the `2^50..2^60` level and produces no `no factor` line. Ask for `50,60` if you
+want that range claimed. This only ever withholds a true claim, never makes a false one,
+and GIMPS assignments do not reach that far down.
 
 ### `runlog.txt` — for you
 
@@ -161,7 +179,9 @@ The ones worth knowing:
 | key | meaning |
 |---|---|
 | `worktodo_file` | where to read the job from (default `worktodo.txt`) |
-| `sieve_primes` | pre-factoring bound. `200000` measured best here; `auto` scales it from the exponent |
+| `sieve` | `gpu` runs pre-factoring on the device (default, new in 1.2); `cpu` is the 1.1 pipeline, kept as the reference |
+| `vector` | candidates per work item: `auto` (2 where available), `1`, `2` |
+| `sieve_primes` | pre-factoring bound. `auto` scales it from the exponent *and* from where the sieve runs — the device wants roughly half the CPU path's depth, since there both sides compete for the same GPU. On `sieve = cpu` it is capped at `segment_size/8`; the run header says so when the cap bites |
 | `arithmetic` | `auto` picks the narrowest exact kernel per bit level; force `64`/`72`/`96`/`128` to compare |
 | `threads` | CPU sieve threads, `0` = auto (cores − 1) |
 | `platform`, `device` | which GPU (see `--list-devices`), `-1` = auto |
