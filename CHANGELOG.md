@@ -4,6 +4,119 @@ Each release is its own directory; earlier ones are kept as they shipped.
 
 ---
 
+## 1.3 — 2026-08-11
+
+**The device sieve stopped scaling with the number of primes.** 1.2 moved the sieve to the
+GPU but left it costing one division per (prime, tile) — so its price tracked how many
+primes there were, not how much work they did. Sieving deeper made runs *slower*, which is
+why `sieve_primes` defaulted to a shallow 120000. That is fixed, and the default is now
+twenty times deeper.
+
+Reference job throughout: `p = 86000009`, `2^66..2^67`, RTX 3070 at its **stock 270 W**
+limit (`sw_power_cap` Not Active, checked before and after), configurations interleaved.
+
+| | inner time |
+|---|---|
+| 1.2 | 9.08 s |
+| **1.3** | **7.94 s** |
+| mfakto 0.15pre8 | 7.10 s |
+
+The gap to mfakto goes **1.28x → 1.12x**. On the reference job from 1.2's own README,
+`p = 9147253`: `2^64..2^65` goes 27 s → **17 s**, and `2^40..2^65` 50 s → **33 s**. Measured at *matched* sieve depth it was much
+worse than the headline: at 1.04 M primes 1.2 took 16.78 s against mfakto's 6.91 s (2.43x),
+because 1.2 got slower with depth while mfakto got faster.
+
+### The attribution
+
+`--profile` (new) gives per-kernel device time. One bit level, before:
+
+| kernel | @120 k | @1.04 M |
+|---|---|---|
+| trial factoring | 6.653 | 5.648 |
+| **sieve_mark_large** | 0.440 | **8.055** |
+| sieve_compact | 0.609 | 0.480 |
+| sieve_mark_tier | 0.678 | 0.675 |
+| sieve_mark_small | 0.184 | 0.183 |
+| sieve_offsets | 0.034 | 0.056 |
+| **total** | **8.598** | **15.096** |
+
+`sieve_mark_large` was 18x more expensive at 1 M for 7x the primes. It was neither ALU- nor
+bandwidth-bound: a tile-size sweep settled it, because halving the number of tiles halved
+the time (8.13 → 4.08 → 2.52 → 1.82 s for 32768 → 262144-bit tiles). The cost was the
+per-(prime, tile) setup, and at a 32768-bit tile **96% of that tier's primes exceeded the
+tile**, so they struck it 0 or 1 times and the division was almost pure waste.
+
+**The kernels were never the gap.** `--bench` reports 2811 M/s with no sieve at all, and
+mfakto's entire sieve+test pipeline runs at 2515–2721 M/s — the Montgomery 24-bit-limb
+arithmetic is competitive with mfakto's Barrett. All of the deficit was the sieve.
+
+### Added
+
+- **`sieve_mark_huge`** — one thread owns one prime for the whole segment. `offs[]` already
+  holds its first strike, so the walk is a chain of additions with no division at all, and
+  strikes go straight to the bitmap with a global `atomic_or`. Runs after `sieve_mark_large`,
+  which stages tiles through LDS and would otherwise clobber it. Takes every prime above
+  262144; below that a prime still strikes a tile often enough that one LDS division per
+  tile beats a global atomic per strike. **8.06 s → 0.85 s** for the two kernels together.
+- **`--profile`** — per-kernel device time via OpenCL events. Every launch is waited on to
+  read its timestamps, so a profiled run's *wall* time is meaningless and is not reported;
+  the per-kernel figures are the device's own and stay valid.
+- **`mersenne_tf72Lx2_gs`**, the sieve fused into trial factoring. A work group compacts one
+  chunk of the bitmap into LDS and immediately tests what it found, so the index list never
+  reaches global memory and there is no `sieve_compact` launch. It calls the same
+  `tf72L_pair()` the split kernel does, so the arithmetic exists once. Worth **0.09 s**
+  (7.66 → 7.59 s, three interleaved pairs).
+  - **Only the 72-bit lazy x2 path has one.** The same kernel was written for the 96-bit x2
+    path and measured *no faster* — 9.67 s split against 9.73 s fused — so it was removed
+    rather than shipped. That kernel carries three 32-bit limbs for each of two candidates
+    and is register-bound, and the 16 KB of LDS the fusion needs costs it more occupancy
+    than the compaction saves. `--no-fuse` runs the split path anywhere for comparison.
+  - The fused kernel's work-group size was swept: 64 / 128 / 256 / 512 gave totals of
+    8.16 / 7.45 / **7.34** / 7.53 s. LDS was never the constraint; small groups simply
+    amortise the compaction over too little work.
+
+### Changed
+
+- **`sieve_mark_large`'s tile is 4096 words (131072 bits, 16 KB of LDS)**, up from 1024,
+  clamped down if the device offers less local memory. With the huge tier taking everything
+  above 262144, this is now only the 2048..262144 band. Threshold and tile were swept
+  together; for a fixed threshold a larger tile always won, until the tile grew enough to
+  starve the device of groups.
+- **`sieve_compact` stages through LDS and writes out coalesced.** A thread owns one word,
+  so it held 0..32 survivors and wrote them as a short run at an offset unrelated to its
+  neighbours' — 32 scattered short runs per warp. Its cost tracked the survivor count, not
+  the word count, which is what gave it away. Now the group prefix-sums in LDS, parks the
+  indices there, then the threads change roles and copy out with consecutive threads on
+  consecutive addresses. **0.61 s → 0.25 s.**
+  - A first attempt replaced the two global atomics per word with one per work-group. That
+    is the obvious suspect and it was **worth nothing** (0.608 → 0.604 s) — the hardware
+    already aggregates same-address atomics within a warp. The group scan was kept because
+    the coalesced writeout needs it anyway.
+- **`sieve_primes = auto` is now 2000000 / 4000000 on the device**, up from 120000 / 250000.
+  The old value was calibrated to a sieve whose cost grew with depth. The curve now falls
+  to about 8 M and is flat from 2 M to 16 M; 4 M sits inside that with half the prime table
+  of the measured minimum.
+
+### Fixed
+
+- The worked example in the manual claimed `313603386094415369` as a factor of `M9147253`.
+  It is not one — `2^p mod q != 1`, and it is not even of the form `2kp+1`. Replaced
+  throughout with `M350377` / `348318885503` (k = 497063), which is checked in the
+  verification below and by the `pow()` one-liner the manual now prints.
+
+### Verified
+
+- `--selftest` green.
+- Survivor counts **bit-identical** to 1.2 at both 120000 and 1037053 primes
+  (20,589,483,541 and 17,373,075,420).
+- `sieve = gpu` and `sieve = cpu` agree **exactly** (17,418,582,161 over 89.1 G candidates)
+  at `sieve_primes = 1000000`, where the `segment_size/8` cap cannot bind so both apply the
+  same primes — and where the huge tier is active. The CPU sieve is an independent
+  implementation and was not touched.
+- End-to-end factor detection: `M350377` → `348318885503` (k = 497063), CPU-verified.
+
+---
+
 ## 1.2 — 2026-08-10
 
 **The sieve moved to the GPU.** Up to 1.1 the CPU marked a bitmap, bit-scanned it and
