@@ -17,12 +17,12 @@ limit (`sw_power_cap` Not Active, checked before and after), configurations inte
 
 | | inner time |
 |---|---|
-| 1.2 | 9.08 s |
-| **1.3** | **7.94 s** |
-| mfakto 0.15pre8 | 7.10 s |
+| 1.2 | 9.01 s |
+| **1.3** | **7.59 s** |
+| mfakto 0.15pre8 | 6.93 s |
 
-The gap to mfakto goes **1.28x → 1.12x**. On the reference job from 1.2's own README,
-`p = 9147253`: `2^64..2^65` goes 27 s → **17 s**, and `2^40..2^65` 50 s → **33 s**. Measured at *matched* sieve depth it was much
+The gap to mfakto goes **1.30x → 1.10x**. On the reference job from 1.2's own README,
+`p = 9147253`: `2^64..2^65` goes 27 s → **17 s**, and `2^40..2^65` 50 s → **32 s**. Measured at *matched* sieve depth it was much
 worse than the headline: at 1.04 M primes 1.2 took 16.78 s against mfakto's 6.91 s (2.43x),
 because 1.2 got slower with depth while mfakto got faster.
 
@@ -92,6 +92,19 @@ arithmetic is competitive with mfakto's Barrett. All of the deficit was the siev
     is the obvious suspect and it was **worth nothing** (0.608 → 0.604 s) — the hardware
     already aggregates same-address atomics within a warp. The group scan was kept because
     the coalesced writeout needs it anyway.
+- **`sieve_mark_tier` is one launch, not one per prime octave.** It stages the bitmap
+  through LDS — read a window, strike it, write it back — so every launch costs a full
+  read-modify-write of the segment. Five octave launches paid that five times, and *that*,
+  not the striking, was most of what the kernel cost: sizing each octave's window to its
+  primes bought an amortised division per (thread, prime) at the price of four extra passes
+  over the bitmap. One window for the whole 64..2047 band instead. **0.68 s → 0.40 s.**
+  The window was swept (words: 8 / 16 / 20 / 24 / 28 / 32 / 48 → 0.658 / 0.466 / **0.401** /
+  0.415 / 0.424 / 0.539 / 0.513 s); it is flat from 20 to 28 and 20 is shipped.
+  - Moving the small/tier boundary was tried too and does not pay: `sieve_mark_small` is
+    three times faster per strike (254 G/s against 87 G/s) because it accumulates a word in
+    a register and never reads the bitmap, but it costs a division per (word, prime) and
+    that overtakes the gain almost immediately above 64. Totals at boundaries 64 / 128 /
+    256 / 512 / 1024: 7.45 / 7.42 / 7.59 / 8.01 / 8.78 s. Left at 64.
 - **`sieve_primes = auto` is now 2000000 / 4000000 on the device**, up from 120000 / 250000.
   The old value was calibrated to a sieve whose cost grew with depth. The curve now falls
   to about 8 M and is flat from 2 M to 16 M; 4 M sits inside that with half the prime table
@@ -99,6 +112,12 @@ arithmetic is competitive with mfakto's Barrett. All of the deficit was the siev
 
 ### Fixed
 
+- **A failed sieve tier launch was silent.** That loop ignored `clEnqueueNDRangeKernel`'s
+  status, so a launch that never ran simply left its primes unsieved — the candidates it
+  should have removed went to the GPU instead. Safe, in that it can never hide a factor,
+  but invisible: it surfaced during the window sweep above, where an over-large LDS request
+  came back with a survivor count nearly twice what it should have been rather than an
+  error. Now checked, and the window is clamped to the device's local memory up front.
 - The worked example in the manual claimed `313603386094415369` as a factor of `M9147253`.
   It is not one — `2^p mod q != 1`, and it is not even of the form `2kp+1`. Replaced
   throughout with `M350377` / `348318885503` (k = 497063), which is checked in the

@@ -15,7 +15,7 @@ work can be pasted straight back.
 **New in 1.3** — the device sieve no longer gets more expensive the deeper it goes. In
 1.2 its cost scaled with the *number of primes* rather than with the work they did, so
 sieving deeper made runs slower and `sieve_primes` had to default to a shallow 120000.
-That is fixed and the default is now twenty times deeper, which is most of a **1.14x**
+That is fixed and the default is now twenty times deeper, which is most of a **1.19x**
 whole-run gain. Full list, with the measurements, in [`CHANGELOG.md`](../CHANGELOG.md).
 
 ---
@@ -202,7 +202,7 @@ Candidate count scales as **1/p** and **doubles with every bit level**. On an RT
 | range | time |
 |---|---|
 | `2^64 .. 2^65` | ~17 s |
-| `2^40 .. 2^65` (everything below, plus that level) | ~33 s |
+| `2^40 .. 2^65` (everything below, plus that level) | ~32 s |
 | each further bit level | double the one before |
 
 (1.2 was ~27 s and ~50 s for the same two.)

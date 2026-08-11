@@ -218,6 +218,10 @@ static bool g_fuse = true;
 // passes the value in as -DTFGS_WG rather than keeping a second copy.
 static const unsigned TFGS_WG = 256;
 
+// Work-group size of sieve_mark_tier.  The plan sizes its LDS from this, so the
+// two must agree.
+static const uint32_t TIER_WG = 64;
+
 // sieve_mark_large's LDS tile, in 32-bit words.  Set once at sieve setup from
 // TILE_WANT, clamped to the device's local memory; see the table there.
 static uint32_t g_tile_words = 4096;
@@ -1935,18 +1939,44 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
         small_last = 0;
         while (small_last < sp.size() && sp[small_last].s < SMALL_MAX) ++small_last;
 
-        // Octave windows carry the middle band; the tile kernel takes the rest.
+        // ONE launch for the whole 64..2047 band, not one per octave.
+        //
+        // The kernel stages the bitmap through LDS -- read a window, strike it,
+        // write it back -- so every launch costs a full read-modify-write of the
+        // segment, 4 MB of traffic at the default segment_size. Five octave
+        // launches paid that five times, and that, not the striking, was most of
+        // what this kernel cost. Sizing each octave's window to the prime was
+        // buying an amortised division per (thread, prime) at the price of four
+        // extra passes over the bitmap, which is a bad trade.
+        //
+        // One window for the whole band means a 67-bit prime strikes it ~10
+        // times and a 2039-bit one once or not at all, and the tier's 291 primes
+        // between them still only cost one division per (thread, prime) once.
+        //
+        // Window swept at sieve_primes=1037053; sieve_mark_tier device time:
+        //
+        //   words        8      16     20     24     28     32     48
+        //   single    0.658   0.466  0.401  0.415  0.424  0.539  0.513
+        //   octave plan: 0.680
+        //
+        // Flat from 20 to 28, and 20 repeated twice at 0.401/0.405.
         const uint32_t TIER_MAX_BITS = 2048;
+        const uint32_t TIER_WPT      = 20;
         size_t i = small_last;
-        while (i < sp.size()) {
-            uint32_t lo = 1; while (lo * 2u <= sp[i].s) lo *= 2u;
-            size_t j = i; while (j < sp.size() && sp[j].s < lo * 2u) ++j;
-            uint64_t win = (uint64_t)lo * 2u;
-            if (win > TIER_MAX_BITS) break;
-            SieveLaunch L;
-            L.first = (uint32_t)i; L.last = (uint32_t)j;
-            L.wpt = (uint32_t)std::max<uint64_t>(1, win / 32);
-            plan.push_back(L);
+        {
+            size_t j = i;
+            while (j < sp.size() && sp[j].s < TIER_MAX_BITS) ++j;
+            if (j > i) {
+                SieveLaunch L;
+                L.first = (uint32_t)i;
+                L.last  = (uint32_t)j;
+                // The LDS this needs is TIER_WG * wpt words; halve the window
+                // rather than fail to launch on a device that offers less.
+                uint32_t wpt = TIER_WPT;
+                while (wpt > 1 && (uint64_t)TIER_WG * wpt * 4 > g.lds) wpt >>= 1;
+                L.wpt = wpt;
+                plan.push_back(L);
+            }
             i = j;
         }
         large_first = (uint32_t)i;
@@ -2453,7 +2483,7 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                         enq(g.k_tier, nw, 1, 256, KP_SMALL);
                     }
                     for (const SieveLaunch& L : plan) {
-                        const size_t TWG = 64;
+                        const size_t TWG = TIER_WG;
                         a = 0;
                         CL.SetKernelArg(g.k_oct, a++, sizeof(cl_mem), &bits_buf[slot]);
                         CL.SetKernelArg(g.k_oct, a++, sizeof(cl_mem), &s_buf);
@@ -2465,8 +2495,16 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                         CL.SetKernelArg(g.k_oct, a++, sizeof(uint32_t), &L.wpt);
                         CL.SetKernelArg(g.k_oct, a++, TWG * L.wpt * sizeof(uint32_t), nullptr);
                         size_t threads = ((size_t)len + (size_t)L.wpt * 32 - 1) / ((size_t)L.wpt * 32);
-                        enq(g.k_oct, threads, 1, TWG, KP_TIER);
+                        // Checked: a launch that fails here strikes nothing, and the
+                        // only symptom is that candidates this tier should have
+                        // removed reach the GPU instead -- slower, silently. (Safe,
+                        // in that it can never hide a factor, but it hid an
+                        // out-of-LDS launch during tuning until a survivor count
+                        // came back nearly twice what it should have been.)
+                        st = enq(g.k_oct, threads, 1, TWG, KP_TIER);
+                        if (st != CL_SUCCESS) { err = "sieve tier launch failed (" + std::to_string(st) + ")"; request_abort(); break; }
                     }
+                    if (st != CL_SUCCESS) break;
                     if (huge_first > large_first) {
                         const uint32_t TILE = g_tile_words;   // set at sieve setup
                         const size_t   LWG  = 256;
