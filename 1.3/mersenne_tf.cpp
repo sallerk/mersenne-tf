@@ -976,6 +976,7 @@ static bool load_config(const std::string& path, Config& cfg, std::string& err)
             if      (val == "auto") cfg.arithmetic = 0;
             else if (val == "64")   cfg.arithmetic = 64;
             else if (val == "72")   cfg.arithmetic = 72;
+            else if (val == "84")   cfg.arithmetic = 84;
             else if (val == "96")   cfg.arithmetic = 96;
             else if (val == "128")  cfg.arithmetic = 128;
             else return fail("arithmetic must be auto/64/72/96/128");
@@ -1032,6 +1033,8 @@ struct Gpu {
     cl_kernel        k_oct       = nullptr;   // octave windows, LDS staged
     cl_kernel        k_large     = nullptr;   // 2048 .. tile, LDS staged
     cl_kernel        k_huge      = nullptr;   // above the tile, one thread per prime
+    cl_kernel        kernel84Lx2   = nullptr; // 84-bit lazy x2 (three 28-bit limbs)
+    cl_kernel        kernel84Lx2gs = nullptr; // ... with the sieve fused in
     cl_kernel        kernel72Lx2gs = nullptr; // 72-bit lazy x2, sieve fused in
     cl_kernel        k_compact   = nullptr;
     std::string      name;
@@ -1042,6 +1045,7 @@ struct Gpu {
     size_t           wg72     = 64;
     size_t           wg72L    = 64;
     size_t           wg72Lx2  = 64;
+    size_t           wg84Lx2  = 64;
     cl_uint          cus      = 0;
     cl_ulong         lds      = 32768;   // CL_DEVICE_LOCAL_MEM_SIZE
 };
@@ -1148,11 +1152,12 @@ static bool gpu_init(Gpu& g, int want_platform, int want_device, std::string& er
     }
     if (!g.xfer || st != CL_SUCCESS) { err = "clCreateCommandQueue(transfer) failed"; return false; }
 
-    const char* srcs[6] = { TF_KERNEL_SOURCE_A, TF_KERNEL_SOURCE_B, TF_KERNEL_SOURCE_C,
-                            TF_KERNEL_SOURCE_C2, TF_KERNEL_SOURCE_D, TF_KERNEL_SOURCE_E };
-    size_t      lens[6] = { strlen(srcs[0]), strlen(srcs[1]), strlen(srcs[2]),
-                            strlen(srcs[3]), strlen(srcs[4]), strlen(srcs[5]) };
-    g.program = CL.CreateProgramWithSource(g.ctx, 6, srcs, lens, &st);
+    const char* srcs[7] = { TF_KERNEL_SOURCE_A, TF_KERNEL_SOURCE_B, TF_KERNEL_SOURCE_C,
+                            TF_KERNEL_SOURCE_C2, TF_KERNEL_SOURCE_D, TF_KERNEL_SOURCE_E,
+                            TF_KERNEL_SOURCE_F };
+    size_t      lens[7] = { strlen(srcs[0]), strlen(srcs[1]), strlen(srcs[2]), strlen(srcs[3]),
+                            strlen(srcs[4]), strlen(srcs[5]), strlen(srcs[6]) };
+    g.program = CL.CreateProgramWithSource(g.ctx, 7, srcs, lens, &st);
     if (!g.program || st != CL_SUCCESS) { err = "clCreateProgramWithSource failed"; return false; }
 
     char bopts[64];
@@ -1184,6 +1189,7 @@ static bool gpu_init(Gpu& g, int want_platform, int want_device, std::string& er
         { &g.k_offsets, "sieve_offsets" },
         { &g.k_tier, "sieve_mark_small" }, { &g.k_oct, "sieve_mark_tier" }, { &g.k_large, "sieve_mark_large" },
         { &g.k_huge, "sieve_mark_huge" }, { &g.kernel72Lx2gs, "mersenne_tf72Lx2_gs" },
+        { &g.kernel84Lx2, "mersenne_tf84Lx2" }, { &g.kernel84Lx2gs, "mersenne_tf84Lx2_gs" },
         { &g.k_compact, "sieve_compact" },
     };
     for (auto& e : sieve_k) {
@@ -1211,6 +1217,7 @@ static bool gpu_init(Gpu& g, int want_platform, int want_device, std::string& er
     g.wg72L = (maxwg >= 256) ? 256 : (maxwg ? maxwg : 64);
     CL.GetKernelWorkGroupInfo(g.kernel72Lx2, g.device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(maxwg), &maxwg, nullptr);
     g.wg72Lx2 = (maxwg >= 256) ? 256 : (maxwg ? maxwg : 64);
+    g.wg84Lx2 = (maxwg >= 256) ? 256 : (maxwg ? maxwg : 64);
     return true;
 }
 
@@ -1225,6 +1232,8 @@ static void gpu_free(Gpu& g)
     if (g.k_large)   CL.ReleaseKernel(g.k_large);
     if (g.k_huge)    CL.ReleaseKernel(g.k_huge);
     if (g.kernel72Lx2gs) CL.ReleaseKernel(g.kernel72Lx2gs);
+    if (g.kernel84Lx2)   CL.ReleaseKernel(g.kernel84Lx2);
+    if (g.kernel84Lx2gs) CL.ReleaseKernel(g.kernel84Lx2gs);
     if (g.k_compact) CL.ReleaseKernel(g.k_compact);
     if (g.kernel72)  CL.ReleaseKernel(g.kernel72);
     if (g.kernel96x2) CL.ReleaseKernel(g.kernel96x2);
@@ -2066,6 +2075,7 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
         const U128 B64 = u128_shl(u128_from(1), 64);
         const U128 B70 = u128_shl(u128_from(1), 70);
         const U128 B72 = u128_shl(u128_from(1), 72);
+        const U128 B82 = u128_shl(u128_from(1), 82);
         const U128 B96 = u128_shl(u128_from(1), 96);
         const int  a   = cfg.arithmetic;
         const int  v   = cfg.vector;
@@ -2078,6 +2088,17 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
             // cost occupancy the 1-wide kernel could not use anyway.
             if (v == 1) { K = g.kernel72L;   WG = g.wg72L;   nm = "72-bit, 24-bit limbs, lazy"; }
             else        { K = g.kernel72Lx2; WG = g.wg72Lx2; nm = "72-bit, 24-bit limbs, lazy, x2"; vpt = 2; }
+        }
+        // Three 28-bit limbs reach 2^82 with the same fifteen products and the same
+        // unnormalised columns as the 24-bit path, so the band that used to fall
+        // back to three 32-bit limbs -- and lose 21% doing it -- no longer does.
+        // This is the band GIMPS actually trial-factors.  It is placed ahead of the
+// eager 72-bit kernel because it also wins the narrow 2^70..2^72 strip
+// (7.81 s against 8.83 s) -- that kernel is 1-wide and reduces every
+// squaring, so the only thing it still has is being reachable by
+// arithmetic = 72 for comparison.
+        else if (!u128_gt(level_hi_excl, B82) && g.kernel84Lx2 && (a == 0 || a == 84)) {
+            K = g.kernel84Lx2; WG = g.wg84Lx2; nm = "84-bit, three 28-bit limbs, lazy, x2"; vpt = 2;
         }
         else if (!u128_gt(level_hi_excl, B72) && (a == 0 || a == 72)) { K = g.kernel72;  WG = g.wg72;  nm = "72-bit, three 24-bit limbs"; }
         else if (!u128_gt(level_hi_excl, B96) && (a == 0 || a == 96 || a == 72)) {
@@ -2198,8 +2219,11 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
         // device sieve and (so far) only for the 72-bit lazy x2 path.
         // Only the 72-bit lazy x2 path has a fused twin -- see tf_kernel.cl.h;
         // the 96-bit one was written, measured no faster, and dropped.
-        cl_kernel Kgs = (g_fuse && cfg.sieve_on_gpu && K == g.kernel72Lx2)
-                        ? g.kernel72Lx2gs : nullptr;
+        cl_kernel Kgs = nullptr;
+        if (g_fuse && cfg.sieve_on_gpu) {
+            if      (K == g.kernel72Lx2) Kgs = g.kernel72Lx2gs;
+            else if (K == g.kernel84Lx2) Kgs = g.kernel84Lx2gs;
+        }
         const bool fused = (Kgs != nullptr);
         if (verbose && knm != last_knm) {
             clear_line();
@@ -3013,7 +3037,7 @@ static bool selftest(Gpu& g, Config cfg)
     // x2 kernels split the batch as gid / gid+nhalf and guard the odd tail with
     // have1; get either wrong and half the candidates are silently never tested,
     // which no amount of "the 1-wide kernel passes" would catch.
-    for (int width : { 64, 72, 96, 128 }) {
+    for (int width : { 64, 72, 84, 96, 128 }) {
      for (int vec : { 1, 2 }) {
       const bool has_x2 = (width == 72 || width == 96);
       if (vec == 2 && !has_x2) continue;
@@ -3022,16 +3046,19 @@ static bool selftest(Gpu& g, Config cfg)
       printf("  -- %s%s --\n",
              width == 64  ? "64-bit arithmetic (two 32-bit limbs)"
              : width == 72 ? "72-bit arithmetic (24-bit limbs; lazy below 2^70)"
+             : width == 84 ? "84-bit arithmetic (28-bit limbs, lazy; two per work item)"
              : width == 96 ? "96-bit arithmetic (32-bit limbs)"
                            : "128-bit arithmetic (64-bit limbs)",
              !has_x2 ? "" : (vec == 2 ? ", two candidates per work item" : ", one candidate per work item"));
       for (const TestCase& tc : cases) {
-        if (width == 64 || width == 72) {        // only cases that fit the width
+        if (width == 64 || width == 72 || width == 84) {   // only cases that fit
             U128 hi; std::string e2;
             parse_u128(tc.fmax, hi, e2);
-            if (u128_gt(hi, u128_shl(u128_from(1), (unsigned)width))) {
+            // the 84-bit kernel is the lazy form, exact only below 2^82
+            const unsigned lim = (width == 84) ? 82u : (unsigned)width;
+            if (u128_gt(hi, u128_shl(u128_from(1), lim))) {
                 printf("  [skip] p=%-5llu range %-26s -> above 2^%d\n",
-                       (unsigned long long)tc.p, tc.fmin, width);
+                       (unsigned long long)tc.p, tc.fmin, (int)lim);
                 continue;
             }
         }

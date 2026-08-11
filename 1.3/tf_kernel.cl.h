@@ -1534,3 +1534,270 @@ void mersenne_tf72Lx2_gs(
     }
 }
 )CLC";
+
+// ===========================================================================
+//  Section F -- three 28-bit limbs, for q < 2^82.
+//
+//  The 24-bit path is the fastest kernel here by a wide margin, and the reason
+//  is not the number 24: it is that a 24x24 product is 48 bits, so a 64-bit
+//  column holds several of them plus carries with no masking and no
+//  normalisation between rounds.  That only needs the peak column to stay under
+//  2^64, and the peak is about 2^(2L+2.3) for three L-bit limbs -- so it holds
+//  all the way to L = 30, not just to L = 24.
+//
+//  Above 2^72 the host used to fall back to three 32-bit limbs, whose columns do
+//  NOT fit and which therefore carry and normalise at every step.  That cost 21%
+//  (2850 -> 2264 M/s) across the whole 2^72..2^96 band -- which is precisely
+//  where GIMPS trial factoring actually happens.  Same fifteen products either
+//  way; the accumulation around them is the entire difference.
+//
+//  L = 28 is the useful point on that curve: 3*28 = 84 bits, lazy reduction
+//  valid to 2^82, and 5.7 bits of headroom left in the column (peak ~2^58.3).
+//  L = 29 and 30 also fit but leave 3.7 and 1.7 bits, which is not margin worth
+//  trading for three more bits of range.
+//
+//  Montgomery, radix 2^28, R = 2^84, mp = -q^-1 mod 2^28.
+//  VALID ONLY FOR q < 2^82.  The host selects per bit level and never straddles.
+// ===========================================================================
+static const char* TF_KERNEL_SOURCE_F = R"CLC(
+typedef struct { uint x, y, z; } u84;      // three 28-bit limbs, little-endian
+
+#define M28 0x0FFFFFFFu
+
+inline int u84_ge(u84 a, u84 b)
+{
+    if (a.z != b.z) return a.z > b.z;
+    if (a.y != b.y) return a.y > b.y;
+    return a.x >= b.x;
+}
+
+inline int u84_eq(u84 a, u84 b) { return a.x == b.x && a.y == b.y && a.z == b.z; }
+
+inline u84 u84_sub(u84 a, u84 b)            // assumes a >= b
+{
+    uint bx = (a.x < b.x) ? 1u : 0u;
+    uint x  = (a.x - b.x) & M28;
+    uint by = (a.y < b.y + bx) ? 1u : 0u;
+    uint y  = (a.y - b.y - bx) & M28;
+    uint z  = (a.z - b.z - by) & M28;
+    u84 r; r.x = x; r.y = y; r.z = z;
+    return r;
+}
+
+inline uint neg_inv28(uint m0)              // -m^-1 mod 2^28, m odd
+{
+    uint x = m0;
+    for (int i = 0; i < 5; ++i) x = x * (2u - m0 * x);   // inverse mod 2^32
+    return (0u - x) & M28;
+}
+
+// x = 2x mod m, for x < m.
+inline u84 mod_dbl84(u84 a, u84 m)
+{
+    uint z = (a.z << 1) | (a.y >> 27);
+    uint y = ((a.y << 1) | (a.x >> 27)) & M28;
+    uint x = (a.x << 1) & M28;
+    uint over = z >> 28;
+    z &= M28;
+    u84 r; r.x = x; r.y = y; r.z = z;
+    if (over || u84_ge(r, m)) r = u84_sub(r, m);
+    return r;
+}
+
+inline u84 r_mod84(u84 m)                   // 2^84 mod m
+{
+    int b;
+    if      (m.z) b = 56 + (32 - clz(m.z));
+    else if (m.y) b = 28 + (32 - clz(m.y));
+    else          b =      (32 - clz(m.x));
+
+    u84 r;
+    if (b == 84) {                          // 0 - m wraps to 2^84 - m
+        uint bx = (0u < m.x) ? 1u : 0u;
+        uint x  = (0u - m.x) & M28;
+        uint by = (0u < m.y + bx) ? 1u : 0u;
+        uint y  = (0u - m.y - bx) & M28;
+        uint z  = (0u - m.z - by) & M28;
+        r.x = x; r.y = y; r.z = z;
+    } else {
+        u84 p2; p2.x = 0; p2.y = 0; p2.z = 0;
+        if      (b < 28) p2.x = 1u << b;
+        else if (b < 56) p2.y = 1u << (b - 28);
+        else             p2.z = 1u << (b - 56);
+        r = u84_sub(p2, m);
+    }
+    for (int i = b; i < 84; ++i) r = mod_dbl84(r, m);
+    return r;
+}
+
+// Montgomery squaring, radix 2^28.  Columns stay unnormalised in 64-bit
+// accumulators exactly as the 24-bit path does; the peak is ~2^58.3, which is
+// where this kernel's 2^82 ceiling comes from.
+//
+// eager = 1 reduces to [0, m).  eager = 0 leaves it in [0, 2m), which is
+// legitimate only when 4m <= R, i.e. m < 2^82.
+inline u84 mont_sqr84(u84 a, u84 m, uint mp, int eager)
+{
+    ulong X0 = a.x, X1 = a.y, X2 = a.z;
+    ulong M0 = m.x, M1 = m.y, M2 = m.z;
+
+    ulong T0 = X0 * X0;
+    ulong T1 = (X0 * X1) << 1;
+    ulong T2 = ((X0 * X2) << 1) + X1 * X1;
+    ulong T3 = (X1 * X2) << 1;
+    ulong T4 = X2 * X2;
+    ulong T5 = 0;
+
+    for (int i = 0; i < 3; ++i) {
+        uint mu = ((uint)T0 * mp) & M28;
+        T0 += (ulong)mu * M0;                // low 28 bits cancel
+        T1 += (ulong)mu * M1;
+        T2 += (ulong)mu * M2;
+        T1 += (T0 >> 28);                    // the only carry that moves
+        T0 = T1; T1 = T2; T2 = T3; T3 = T4; T4 = T5; T5 = 0;
+    }
+
+    ulong acc = T0;
+    uint r0 = (uint)acc & M28; acc >>= 28;
+    acc += T1;
+    uint r1 = (uint)acc & M28; acc >>= 28;
+    acc += T2;
+    uint r2 = (uint)acc & M28; acc >>= 28;
+
+    u84 r; r.x = r0; r.y = r1; r.z = r2;
+    if (eager) {
+        if ((uint)acc != 0u || u84_ge(r, m)) r = u84_sub(r, m);
+    }
+    return r;
+}
+
+inline u84 q_to_u84(ulong q_lo, ulong q_hi)
+{
+    u84 q;
+    q.x = (uint)(q_lo & M28);
+    q.y = (uint)((q_lo >> 28) & M28);
+    q.z = (uint)(((q_lo >> 56) | (q_hi << 8)) & M28);
+    return q;
+}
+
+// The lazy pair test for q < 2^82.  Same shape as tf72L_pair, one radix wider.
+inline void tf84L_pair(
+    uint c0, uint c1, int have1,
+    const ulong base_lo, const ulong base_hi, const ulong step,
+    const ulong twop, const ulong pexp, const int pbits,
+    __global uint *found_count, __global ulong2 *found, const uint found_cap)
+{
+    ulong q0_lo, q0_hi, q1_lo, q1_hi;
+    build_q(c0, base_lo, base_hi, step, twop, &q0_lo, &q0_hi);
+    build_q(c1, base_lo, base_hi, step, twop, &q1_lo, &q1_hi);
+    u84 q0 = q_to_u84(q0_lo, q0_hi);
+    u84 q1 = q_to_u84(q1_lo, q1_hi);
+
+    // 2q, for the doubling step's single correction
+    u84 q0d, q1d;
+    { uint z = (q0.z << 1) | (q0.y >> 27);
+      uint y = ((q0.y << 1) | (q0.x >> 27)) & M28;
+      uint w = (q0.x << 1) & M28;
+      q0d.x = w; q0d.y = y; q0d.z = z; }
+    { uint z = (q1.z << 1) | (q1.y >> 27);
+      uint y = ((q1.y << 1) | (q1.x >> 27)) & M28;
+      uint w = (q1.x << 1) & M28;
+      q1d.x = w; q1d.y = y; q1d.z = z; }
+
+    uint mp0 = neg_inv28(q0.x), mp1 = neg_inv28(q1.x);
+    u84  one0 = r_mod84(q0),    one1 = r_mod84(q1);
+    u84  x0 = one0,             x1 = one1;
+
+    for (int b = pbits - 1; b >= 0; --b) {
+        x0 = mont_sqr84(x0, q0, mp0, 0);     // stays in [0, 2q)
+        x1 = mont_sqr84(x1, q1, mp1, 0);
+        if ((pexp >> b) & 1UL) {
+            uint z0 = (x0.z << 1) | (x0.y >> 27);
+            uint y0 = ((x0.y << 1) | (x0.x >> 27)) & M28;
+            uint w0 = (x0.x << 1) & M28;
+            x0.x = w0; x0.y = y0; x0.z = z0;
+            if (u84_ge(x0, q0d)) x0 = u84_sub(x0, q0d);
+
+            uint z1 = (x1.z << 1) | (x1.y >> 27);
+            uint y1 = ((x1.y << 1) | (x1.x >> 27)) & M28;
+            uint w1 = (x1.x << 1) & M28;
+            x1.x = w1; x1.y = y1; x1.z = z1;
+            if (u84_ge(x1, q1d)) x1 = u84_sub(x1, q1d);
+        }
+    }
+
+    if (u84_ge(x0, q0)) x0 = u84_sub(x0, q0);       // normalise both sides once
+    if (u84_ge(one0, q0)) one0 = u84_sub(one0, q0);
+    if (u84_ge(x1, q1)) x1 = u84_sub(x1, q1);
+    if (u84_ge(one1, q1)) one1 = u84_sub(one1, q1);
+
+    if (u84_eq(x0, one0)) {
+        uint slot = atomic_inc(found_count);
+        if (slot < found_cap) found[slot] = (ulong2)(q0_lo, q0_hi);
+    }
+    if (have1 && u84_eq(x1, one1)) {
+        uint slot = atomic_inc(found_count);
+        if (slot < found_cap) found[slot] = (ulong2)(q1_lo, q1_hi);
+    }
+}
+
+__kernel void mersenne_tf84Lx2(
+    __global const uint  *idx,
+    __global const uint  *n_buf,
+    const ulong           base_lo,
+    const ulong           base_hi,
+    const ulong           step,
+    const ulong           twop,
+    const ulong           pexp,
+    const int             pbits,
+    __global uint        *found_count,
+    __global ulong2      *found,
+    const uint            found_cap)
+{
+    uint gid = get_global_id(0);
+    uint n = n_buf[0];
+    uint nhalf = (n + 1) >> 1;
+    if (gid >= nhalf) return;
+
+    uint i0 = gid;
+    uint i1 = gid + nhalf;
+    int  have1 = (i1 < n);
+    if (!have1) i1 = i0;                     // harmless duplicate; report is guarded
+
+    tf84L_pair(idx[i0], idx[i1], have1, base_lo, base_hi, step, twop, pexp, pbits,
+               found_count, found, found_cap);
+}
+
+__kernel __attribute__((reqd_work_group_size(TFGS_WG, 1, 1)))
+void mersenne_tf84Lx2_gs(
+    __global const uint  *bits,
+    const uint            len,
+    const ulong           base_lo,
+    const ulong           base_hi,
+    const ulong           step,
+    const ulong           twop,
+    const ulong           pexp,
+    const int             pbits,
+    __global uint        *found_count,
+    __global ulong2      *found,
+    const uint            found_cap,
+    __global uint        *phase_total)
+{
+    __local ushort sidx[TFGS_CHUNK];
+    __local uint   scan[TFGS_WG];
+
+    const uint lid = get_local_id(0), grp = get_group_id(0);
+    const uint nloc = tfgs_compact(bits, len, lid, grp, scan, sidx, phase_total);
+
+    const uint chunk_base = grp * TFGS_CHUNK;
+    const uint nhalf = (nloc + 1u) >> 1;
+    for (uint t = lid; t < nhalf; t += TFGS_WG) {
+        uint j1 = t + nhalf;
+        int  have1 = (j1 < nloc);
+        uint c0 = chunk_base + (uint)sidx[t];
+        uint c1 = have1 ? (chunk_base + (uint)sidx[j1]) : c0;
+        tf84L_pair(c0, c1, have1, base_lo, base_hi, step, twop, pexp, pbits,
+                   found_count, found, found_cap);
+    }
+}
+)CLC";

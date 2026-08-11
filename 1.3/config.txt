@@ -149,14 +149,24 @@ vector = auto
 #  auto picks the narrowest kernel that is exact for the bit level being
 #  scanned, and re-picks at every level:
 #     q < 2^70   three 24-bit limbs, lazy reduction   (fastest)
-#     q < 2^72   three 24-bit limbs
+#     q < 2^82   three 28-bit limbs, lazy reduction
 #     q < 2^96   three 32-bit limbs
 #     otherwise  two 64-bit limbs
+#  (three 24-bit limbs, eager, still exists for q < 2^72 but auto no longer
+#   selects it -- the 28-bit path is 1-wide-vs-2-wide faster over that strip.)
 #  Narrower is faster because the cost is the accumulation around the multiplies
 #  rather than the multiplies themselves -- sizing the limbs to the candidate
 #  measures 1.46x over the 96-bit path, and skipping the per-squaring reduction
-#  1.78x.  Force 72/96/128 only to compare them; a forced width that cannot hold
-#  the candidates is ignored rather than silently used.
+#  1.78x.  Force 64/72/84/96/128 only to compare them; a forced width that cannot
+#  hold the candidates is ignored rather than silently used.
+#
+#  The 28-bit path is new.  The 24-bit one is fast not because 24 is special but
+#  because a 24x24 product is 48 bits, so a 64-bit column holds several of them
+#  plus carries without normalising -- and that holds up to 30-bit limbs, not 24.
+#  Everything from 2^72 to 2^96 used to fall back to three 32-bit limbs, whose
+#  columns do not fit; three 28-bit limbs reach 2^82 with the same fifteen
+#  products and the cheap accumulation, worth 21% on the kernel and 1.18x on a
+#  whole run at 2^76 -- which is the range GIMPS trial factoring actually uses.
 # ---------------------------------------------------------------------------
 arithmetic = auto
 

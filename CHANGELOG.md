@@ -61,6 +61,22 @@ arithmetic is competitive with mfakto's Barrett. All of the deficit was the siev
 - **`--profile`** — per-kernel device time via OpenCL events. Every launch is waited on to
   read its timestamps, so a profiled run's *wall* time is meaningless and is not reported;
   the per-kernel figures are the device's own and stay valid.
+- **`mersenne_tf84Lx2` / `_gs`, three 28-bit limbs, for `q < 2^82`.** The 24-bit path
+  is the fastest kernel here, and the reason is not the number 24: a 24x24 product is 48
+  bits, so a 64-bit column holds several of them plus carries with no masking and no
+  normalisation between rounds. That only needs the peak column under 2^64, and the peak
+  is ~2^(2L+2.3) for three L-bit limbs — so it holds to L = 30, not to L = 24. Everything
+  from 2^72 up used to fall back to three 32-bit limbs, whose columns do *not* fit and
+  which therefore carry and normalise at every step; that cost **21%** (2850 → 2264 M/s)
+  across the whole band GIMPS actually trial-factors. Same fifteen products either way.
+  L = 28 leaves 5.7 bits of headroom (peak ~2^58.3); 29 and 30 also fit but leave 3.7 and
+  1.7, which is not margin worth three more bits of range for.
+  - `auto` now uses it for **2^70 .. 2^82**. A 2^76 slice goes **9.00 s → 7.65 s (1.18x)**;
+    the 2^70..2^72 strip goes 8.83 s → 7.81 s, because the eager 24-bit kernel it replaces
+    there is 1-wide and reduces every squaring.
+  - Below 2^70 the 24-bit path still wins (7.32 s against 7.87 s) and keeps that band.
+  - mfakto has no cliff at 2^72 either — its `cl_barrett32_76/77` kernels match its
+    `cl_barrett15_69/70` ones in `--perftest`. This closes the same gap a different way.
 - **`mersenne_tf72Lx2_gs`**, the sieve fused into trial factoring. A work group compacts one
   chunk of the bitmap into LDS and immediately tests what it found, so the index list never
   reaches global memory and there is no `sieve_compact` launch. It calls the same
@@ -125,7 +141,10 @@ arithmetic is competitive with mfakto's Barrett. All of the deficit was the siev
 
 ### Verified
 
-- `--selftest` green.
+- `--selftest` green, now sweeping **five** widths (64/72/84/96/128) rather than four.
+  The 84-bit kernel is exercised against M_193's 76-bit factor `61654440233248340616559`,
+  which is the only shipped case that lands in its band — without adding 84 to that
+  sweep the new kernel would have been covered by nothing at all.
 - Survivor counts **bit-identical** to 1.2 at both 120000 and 1037053 primes
   (20,589,483,541 and 17,373,075,420).
 - `sieve = gpu` and `sieve = cpu` agree **exactly** (17,418,582,161 over 89.1 G candidates)
