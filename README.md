@@ -7,15 +7,37 @@ the program only ever works modulo the candidate, which is at most 128 bits. Res
 written in the format the [GIMPS manual submission page](https://www.mersenne.org/manual_result/)
 expects.
 
+## Performance
+
+Whole runs on an RTX 3070 at its stock 270 W, start-up included. Each figure is the median
+of three rounds, with the three programs alternating job by job. Survivor counts are
+identical between 1.3 and 1.4.
+
+| job | 1.3 | **1.4** | mfaktc 0.24.1 | 1.3 → 1.4 | 1.4 vs mfaktc |
+|---|---|---|---|---|---|
+| `p = 9147253`, `2^65..2^66` | 32.53 s | **18.60 s** | 19.32 s | 1.75x | 4% faster |
+| `p = 27886007`, `2^66..2^67` | 22.00 s | **13.09 s** | 14.03 s | 1.68x | 7% faster |
+| `p = 110000017`, `2^69..2^70` | 46.68 s | **27.17 s** | 28.57 s | 1.72x | 5% faster |
+| `p = 999000011`, `2^72..2^73` | 44.50 s | **25.97 s** | 27.59 s | 1.71x | 6% faster |
+| `p = 999000011`, a `2^81` slice | 44.82 s | **26.69 s** | — | 1.68x | |
+| `p = 999000011`, a `2^87` slice | 44.58 s | **31.62 s** | — | 1.41x | |
+
+mfaktc cannot run part of a bit level, so the slices have no mfaktc figure. 1.4 beat
+mfaktc in all 48 pairings measured. mfaktc's own times move more than ours from one session
+to the next, though, so read the margin as a few percent. Where the time goes, and what
+was tried and dropped, is in [CHANGELOG.md](CHANGELOG.md).
+
 ## Download
 
-Each version has its own release, with a **prebuilt 64-bit Windows binary** inside — you do
-not need Visual Studio, a CUDA Toolkit or an OpenCL SDK to run it. The only requirement is
-`OpenCL.dll`, which ships with your GPU driver.
+Each released version has its own release page, with a **prebuilt 64-bit Windows binary**
+inside — you do not need Visual Studio, a CUDA Toolkit or an OpenCL SDK to run it. The only
+requirement is `OpenCL.dll`, which ships with your GPU driver. 1.4 has no prebuilt binary
+yet: build it from source (see Quick start below).
 
 | version | download | |
 |---|---|---|
-| **1.3** | [**mersenne_tf-1.3-win64.zip**](https://github.com/sallerk/mersenne-tf/releases/download/v1.3/mersenne_tf-1.3-win64.zip) | current. A device sieve that pays to run deep, and 28-/30-bit limbs that removed a 21% cliff above `2^72`. **1.18x** over 1.2 at `2^66`, **1.39x** at `2^76`. Start here — see [1.3/README.md](1.3/README.md). |
+| **1.4** | source only: [1.4/](1.4/) | current. A trial-factoring kernel compiled for each exponent, and a device sieve whose largest primes are struck inside that kernel. **About 1.7x** over 1.3, and a few percent ahead of mfaktc on the same card (table above). Also stops a GPU fault from being reported as "no factor". See [1.4/README.md](1.4/README.md). |
+| **1.3** | [**mersenne_tf-1.3-win64.zip**](https://github.com/sallerk/mersenne-tf/releases/download/v1.3/mersenne_tf-1.3-win64.zip) | newest prebuilt binary. A device sieve that pays to run deep, and 28-/30-bit limbs that removed a 21% cliff above `2^72`. **1.18x** over 1.2 at `2^66`, **1.39x** at `2^76`. See [1.3/README.md](1.3/README.md). |
 | 1.2 | [mersenne_tf-1.2-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.2/mersenne_tf-1.2-win64.zip) | moved the sieve to the GPU — the whole pipeline is device-side. Kept as-is. |
 | 1.1 | [mersenne_tf-1.1-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.1/mersenne_tf-1.1-win64.zip) | reports the sieve bound it actually applies, not the one you asked for. Kept as-is. |
 | 1.0 | [mersenne_tf-1.0-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.0/mersenne_tf-1.0-win64.zip) | job moved to `worktodo.txt`; results in GIMPS manual-submission format. Kept as-is. |
@@ -44,7 +66,7 @@ Or build from source — Visual Studio 2019/2022 with "Desktop development with 
 nothing else:
 
 ```bash
-cd 1.3
+cd 1.4
 build.bat
 ```
 
@@ -87,8 +109,8 @@ least important fields rather than spilling onto a second one.
 parses:
 
 ```
-M350377 has a factor: 348318885503 [TF:38:39:mersenne_tf 1.3]
-no factor for M9147253 from 2^64 to 2^65 [mersenne_tf 1.3]
+M350377 has a factor: 348318885503 [TF:38:39:mersenne_tf 1.4]
+no factor for M9147253 from 2^64 to 2^65 [mersenne_tf 1.4]
 ```
 
 A `no factor` line is written **as each bit level clears**, so a run stopped part way still
@@ -126,9 +148,9 @@ appended to `results.txt` the instant they are found, so they survive even an un
   refuses rather than silently returning a wrong "no factor".
 - **Candidates are capped at `2^127-1`**, the arithmetic limit. Well above anything GIMPS
   trial-factors.
-- **Above `2^96` throughput drops.** Exact-width kernels cover the band that matters —
-  24-bit limbs below `2^70`, 28-bit to `2^82`, 30-bit to `2^88`, 32-bit to `2^96` — and
-  everything past that falls back to the general 128-bit path.
+- **Above `2^96` throughput drops.** Exact-width kernels cover the band that matters — in
+  1.4, 28-bit limbs below `2^80`, 30-bit to `2^88`, 32-bit to `2^96` — and everything past
+  that falls back to the general 128-bit path.
 - **Deep levels are inherently expensive.** Candidate count doubles with every bit level;
   that is trial factoring, not this implementation.
 - **Tuned on one GPU.** The defaults were measured on an RTX 3070. They should be sane
