@@ -9,35 +9,31 @@ expects.
 
 ## Performance
 
-Whole runs on an RTX 3070 at its stock 270 W, start-up included. Each figure is the median
-of three rounds, with the three programs alternating job by job. Survivor counts are
-identical between 1.3 and 1.4.
+mersenne_tf 1.4 against mfaktc 0.24.1 on the same RTX 3070, at its stock 270 W. Whole runs,
+start-up included; each figure is the median of three rounds, with the programs
+alternating job by job.
 
-| job | 1.3 | **1.4** | mfaktc 0.24.1 | 1.3 → 1.4 | 1.4 vs mfaktc |
-|---|---|---|---|---|---|
-| `p = 9147253`, `2^65..2^66` | 32.53 s | **18.60 s** | 19.32 s | 1.75x | 4% faster |
-| `p = 27886007`, `2^66..2^67` | 22.00 s | **13.09 s** | 14.03 s | 1.68x | 7% faster |
-| `p = 110000017`, `2^69..2^70` | 46.68 s | **27.17 s** | 28.57 s | 1.72x | 5% faster |
-| `p = 999000011`, `2^72..2^73` | 44.50 s | **25.97 s** | 27.59 s | 1.71x | 6% faster |
-| `p = 999000011`, a `2^81` slice | 44.82 s | **26.69 s** | — | 1.68x | |
-| `p = 999000011`, a `2^87` slice | 44.58 s | **31.62 s** | — | 1.41x | |
+| job | **mersenne_tf 1.4** | mfaktc 0.24.1 | |
+|---|---|---|---|
+| `p = 9147253`, `2^65..2^66` | **18.60 s** | 19.32 s | 4% faster |
+| `p = 27886007`, `2^66..2^67` | **13.09 s** | 14.03 s | 7% faster |
+| `p = 110000017`, `2^69..2^70` | **27.17 s** | 28.57 s | 5% faster |
+| `p = 999000011`, `2^72..2^73` | **25.97 s** | 27.59 s | 6% faster |
 
-mfaktc cannot run part of a bit level, so the slices have no mfaktc figure. 1.4 beat
-mfaktc in all 48 pairings measured. mfaktc's own times move more than ours from one session
-to the next, though, so read the margin as a few percent. Where the time goes, and what
-was tried and dropped, is in [CHANGELOG.md](CHANGELOG.md).
+mersenne_tf won all 48 pairings measured. mfaktc's own times move more than ours from one
+session to the next, though, so read the margin as a few percent. Where the time goes, and
+what was tried and dropped, is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Download
 
-Each released version has its own release page, with a **prebuilt 64-bit Windows binary**
-inside — you do not need Visual Studio, a CUDA Toolkit or an OpenCL SDK to run it. The only
-requirement is `OpenCL.dll`, which ships with your GPU driver. 1.4 has no prebuilt binary
-yet: build it from source (see Quick start below).
+Each version has its own release, with a **prebuilt 64-bit Windows binary** inside — you do
+not need Visual Studio, a CUDA Toolkit or an OpenCL SDK to run it. The only requirement is
+`OpenCL.dll`, which ships with your GPU driver.
 
 | version | download | |
 |---|---|---|
-| **1.4** | source only: [1.4/](1.4/) | current. A trial-factoring kernel compiled for each exponent, and a device sieve whose largest primes are struck inside that kernel. **About 1.7x** over 1.3, and a few percent ahead of mfaktc on the same card (table above). Also stops a GPU fault from being reported as "no factor". See [1.4/README.md](1.4/README.md). |
-| **1.3** | [**mersenne_tf-1.3-win64.zip**](https://github.com/sallerk/mersenne-tf/releases/download/v1.3/mersenne_tf-1.3-win64.zip) | newest prebuilt binary. A device sieve that pays to run deep, and 28-/30-bit limbs that removed a 21% cliff above `2^72`. **1.18x** over 1.2 at `2^66`, **1.39x** at `2^76`. See [1.3/README.md](1.3/README.md). |
+| **1.4** | [**mersenne_tf-1.4-win64.zip**](https://github.com/sallerk/mersenne-tf/releases/download/v1.4/mersenne_tf-1.4-win64.zip) | current. A trial-factoring kernel compiled for each exponent, and a device sieve whose largest primes are struck inside that kernel: a few percent ahead of mfaktc on the same card (table above). Also stops a GPU fault from being reported as "no factor". Start here — see [1.4/README.md](1.4/README.md). |
+| 1.3 | [mersenne_tf-1.3-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.3/mersenne_tf-1.3-win64.zip) | a device sieve that pays to run deep, and 28-/30-bit limbs that removed a 21% cliff above `2^72`. **1.18x** over 1.2 at `2^66`, **1.39x** at `2^76`. Kept as-is. |
 | 1.2 | [mersenne_tf-1.2-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.2/mersenne_tf-1.2-win64.zip) | moved the sieve to the GPU — the whole pipeline is device-side. Kept as-is. |
 | 1.1 | [mersenne_tf-1.1-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.1/mersenne_tf-1.1-win64.zip) | reports the sieve bound it actually applies, not the one you asked for. Kept as-is. |
 | 1.0 | [mersenne_tf-1.0-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.0/mersenne_tf-1.0-win64.zip) | job moved to `worktodo.txt`; results in GIMPS manual-submission format. Kept as-is. |
