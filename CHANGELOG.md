@@ -4,6 +4,212 @@ Each release is its own directory; earlier ones are kept as they shipped.
 
 ---
 
+## 1.4 — 2026-10-03
+
+**About 1.7x faster for GIMPS-sized exponents, and now a few percent ahead of mfaktc on
+the same card.** A new trial-factoring kernel gave 1.5x; a reworked device sieve gave the
+rest.
+
+The starting point was a gap against mfaktc much larger than expected. On the same RTX 3070
+(stock 270 W, `sw_power_cap` Not Active, runs interleaved), mfaktc 0.24.1 took 13.3 s for
+`p = 27886007, 2^66..2^67` where 1.3 took 21.5 s — 1.6x. `nsys` put mfaktc's device time
+at 9.71 s TF + 1.71 s sieve against 1.3's 17.05 s + 5.70 s, so both halves were behind, the
+TF kernel most.
+
+| job | 1.3 | **1.4** | mfaktc 0.24.1 | 1.3 → 1.4 | mfaktc ÷ 1.4 |
+|---|---|---|---|---|---|
+| `p = 9147253`, `2^65..2^66` | 32.53 s | **18.60 s** | 19.32 s | 1.75x | 1.04x |
+| `p = 27886007`, `2^66..2^67` | 22.00 s | **13.09 s** | 14.03 s | 1.68x | 1.07x |
+| `p = 110000017`, `2^69..2^70` | 46.68 s | **27.17 s** | 28.57 s | 1.72x | 1.05x |
+| `p = 999000011`, `2^72..2^73` | 44.50 s | **25.97 s** | 27.59 s | 1.71x | 1.06x |
+| `p = 999000011`, `2^81` slice | 44.82 s | **26.69 s** | — | 1.68x | |
+| `p = 999000011`, `2^87` slice | 44.58 s | **31.62 s** | — | 1.41x | |
+
+Whole runs, start-up included, medians of three rounds; each round ran the three programs
+job by job. 1.4 beat mfaktc in all twelve pairings. Survivor counts are identical between
+1.3 and 1.4 on every row. mfaktc cannot run part of a level, so the slices have no mfaktc
+figure. The new kernel on its own was 1.5x over 1.3: 14.48 s on the `p = 27886007` row, in
+an earlier session where mfaktc took 12.88 s. The sieve work below added 1.11–1.16x on
+every row, measured against that build in rounds of its own.
+
+**Against mfaktc, read the last column as "a few percent", not as its digits.** 1.4 was
+faster in all 48 pairings run that afternoon: these three rounds; three more with mfaktc
+at both this install's `AllowSleep=1` and its default 0, which made no difference; and
+three with a near-final build. At the medians the margin is 3–8%. But mfaktc's times
+spread more than ours, 13.4–14.7 s on the `p = 27886007` job against 13.0–13.8 s, and in
+an earlier session it ran that job in 12.88 s. On those figures the two are about level
+there. Its kernels took the same device time both times (11.44 and 11.45 s by `nsys`).
+What moves is the 2.4–2.7 s it leaves the GPU idle between kernels, which is host-side.
+Nor does the card favour one program: logged during these runs, all three held
+1895–1906 MHz at 74–77 °C.
+
+**Where the device time goes**, `--profile` at `p = 27886007, 2^66`, seconds per level:
+
+| | TF | sieve | of which offsets | small primes | tiles | huge primes |
+|---|---|---|---|---|---|---|
+| 1.3 | 17.05 | 5.70 | | | | |
+| 1.4 kernel, 1.3-style sieve | 9.50 | 4.51 | 0.34 | 0.57 | 2.07 | 1.54 |
+| 1.4 | 9.9–10.4 | 2.3 | 0.09 | (in tiles) | 2.2 | ~0.01, the rest inside TF |
+| mfaktc 0.24.1 (`nsys`) | 9.71 | 1.71 | | | | |
+
+mfaktc sieves only to about 1 M (82486 primes) against our 5.5 M; at 1 M we would test
+11.5% more candidates than we do. If its survivor count there is about ours (not
+measured), its kernel is ~8% faster per candidate tested. We make that back by testing
+fewer, and by leaving the GPU idle less.
+
+### The kernel (Section H of `tf_kernel.cl.h`)
+
+Built per exponent, as three 28- or 30-bit limbs, Montgomery with lazy reduction. Kernel
+throughput, M candidates/s, paired against the 1.3 kernels in a harness:
+
+| level | 1.3 kernel | | 1.4 | | |
+|---|---|---|---|---|---|
+| `2^62` | 64-bit | 4003 | 28-bit | 4882 | 1.29x |
+| `2^66` | 72-bit lazy x2 | 3010 | 28-bit | 5097 | 1.69x |
+| `2^74`, `p = 999000011` | 84-bit lazy x2 | 2478 | 28-bit | 4294 | 1.73x |
+| `2^81` | 90-bit lazy x2 | 2500 | 30-bit | 3815 | 1.53x |
+| `2^87` | 90-bit lazy x2 | 2519 | 30-bit, reducing | 3093 | 1.25x |
+
+Where it comes from, roughly in order of size:
+
+- **Free doubling.** `x = 2x mod q` is not done at all: the next squaring is handed `2x`, as
+  limbs shifted by one. With `x < 2q`, `((2x)^2 + mu q) / R < 16q^2/R + q <= 2q` while
+  `16q <= R`, so the output is back in `[0, 2q)` with no compare and no subtract. That holds
+  for `q < 2^80` at 28-bit limbs and `q < 2^86` at 30. ~1.2x. Above `2^86` the 30-bit kernel
+  keeps a reducing doubling (`4q <= R` still holds to `2^88`).
+- **The start value.** The leading 6 bits of `p` (value `e`) are not squared through: the
+  loop starts from `mont(2^e) = 2^(3L+e) mod q`, by a chunked long division with an integer
+  reciprocal (one 32-bit division and a Newton step). That also replaces 1.3's `mont(1)`,
+  a chain of 3L modular doublings per candidate, and the final test becomes one REDC and a
+  compare against `(q+1)/2`. ~1.13–1.2x. 4 to 7 bits measured the same; 8 was worse.
+- **`p` compiled in**, so the loop unrolls with every doubling known: ~4%.
+- **The squaring**, doubling the cross terms before the multiply and keeping the 28-bit
+  reduction carry in 32 bits: ~7%.
+
+24-bit limbs measured exactly as fast as 28-bit, so the 24-bit kernels are gone and
+`arithmetic = 64/72` with them. The 30-bit free kernel also beats a 28-bit reducing one in
+`2^80..2^82` (3815 against 3267 M/s), so auto never uses the latter.
+
+The build costs about 0.35 s per exponent and width the first time; NVIDIA's driver caches
+it after that. Startup is otherwise slightly faster than 1.3, the main program being
+smaller.
+
+Tried and dropped: two or four candidates per thread (within 1% of one — the kernel is
+issue-bound, not latency-bound); forcing `mul.wide` through inline PTX (1.2% slower);
+overlapping sieve and TF on two queues (in a two-kernel test NVIDIA's OpenCL did not run
+them concurrently, and the pair got slower). Inside one launch they do overlap, which the
+sieve below makes use of.
+
+### The sieve
+
+Per level at `p = 27886007, 2^66`: **4.51 s → 2.3 s** of sieve kernels, plus 0.1–0.3 s the
+largest primes now add to the TF kernel.
+
+- **The huge primes are struck from inside the TF kernel.** Primes above 262144 strike a
+  segment at most 64 times each, so they go straight to global memory, one thread per
+  prime, with `atomic_or`. That was 1.54 s per level, 1.33 s of it the atomics alone — L2
+  throughput — while the TF kernel is bound by integer issue and leaves L2 idle. Each TF
+  launch now ends by walking the *next* segment's huge primes, spread across its groups,
+  so the host enqueues each segment's TF after the next segment's tile kernel. The walk
+  adds 0.1–0.3 s to the TF kernel, where it took 1.5–1.6 s as a kernel of its own. Where
+  it goes matters: at the start of the kernel it cost 0.64 s, between its barriers 1.4 s.
+- **Primes below 64 are built in registers.** `sieve_mark_small` wrote a bitmap that the
+  tile kernel then loaded. Now each tile thread ORs in, for each of those 13 primes, a
+  64-bit comb of its multiples shifted to the word's offset, stepping the offset word by
+  word. A 0.57 s kernel became 0.12 s more on the tile kernel.
+- **Offsets carry over from segment to segment.** A class's segments are contiguous, so a
+  prime's first strike in the next one is `(o − len) mod s`: one 32-bit reduction by a
+  stored reciprocal instead of two 64-bit remainders, and the huge walk leaves its own next
+  offset behind. Only a class's first segment computes them in full: **0.34 → 0.09 s**.
+- Rechecked after these, unchanged. `sieve_primes`, device time per level: 12.19 s at
+  5.5 M, 12.10 at 8 M, 12.23 at 16 M, 12.72 at 32 M. The candidates keep falling with
+  depth (48.2 G → 43.4 G), but by 32 M the extra huge primes show in the TF kernel. The
+  huge threshold: 12.19 s at 262144, 12.18 at 131072, 13.36 at 65536.
+
+Tried and dropped:
+
+- Huge primes as tile items, like the large ones: worse at every depth (7.4 s against
+  3.0 s at 1 M, about 30 s at 5.5 M). The cost per item is fetching its table entries,
+  not the division; a float-reciprocal first strike was slower still.
+- A plain OR instead of local-memory atomics in the tiles. The atomics cost ~0.55 s, but
+  without them colliding strikes are lost and 8.9% more candidates reach the TF kernel.
+- 8192-word tiles, or 1024-thread groups: 2.6–2.7 s against 2.2 s.
+- The tile kernel's work inside the TF launch as well: 4.2 s more on the TF kernel, against
+  the 2.2 s it replaced. Unlike the huge walk, it competes with TF for the same units.
+
+Earlier in this release:
+
+- `sieve_mark_tier` is gone. Its primes (64..2047) are struck by `sieve_mark_large` as
+  (prime, 8192-bit sub-tile) items, inside the tile it already stages: the two kernels went
+  **2.35 s → 2.04 s**. The cost there is the strikes, not the divisions — six times fewer
+  divisions bought only that much.
+- `sieve_mark_large` runs **512-thread groups**: a segment is only 128 tiles, and 256 left
+  the SMs under half occupied. **1.71 s → 1.18 s** on its own (1024: 1.42 s).
+  NVIDIA's driver reports `CL_KERNEL_WORK_GROUP_SIZE = 256` for every kernel in the
+  program, this one included while it declares `reqd_work_group_size(512)`, and runs 512
+  without complaint. So the size comes from the device limit, a build that refuses it is
+  retried at 256, and each launch's status is checked.
+- `sieve_offsets` takes two 64-bit remainders per prime instead of six: **0.49 → 0.34 s**.
+- Rechecked, unchanged: the huge threshold (262144 still best: 2.03 + 0.91 s, against
+  3.82 + 0.41 at 524288), `segment_size` (2^24: 14.5 s, 2^23: 16.2 s, 2^25: 17.1 s), and
+  `sieve_primes` (flat).
+
+### Self test
+
+Now runs `auto` first — the mode a real run uses — then each forced width. New cases put a
+factor in every band: an 8-digit exponent (`M48205429`, factors found by mfaktc), an 83-bit
+factor of `M97`, and factors at 2^81.5, 2^86.6 and 2^87.5 of exponents just below 2^62,
+found for the purpose by an independent CPU search (`gmpy2`), where `k` is small enough for
+that to take seconds. Checked to fail: compiling the kernels for `p + 2` fails every case
+in the 28/30-bit modes whose factor the GPU has to find (the tiny ones below the sieve
+bound are tested on the CPU and still pass).
+
+### Fixed
+
+- **A GPU fault could report a level as cleared.** The reads that bring back the factor
+  count and the survivor total ignored their status, as did the `clFinish` at the end of
+  each phase. After a kernel fault every later call fails, so the run read no hits, logged
+  the level complete and wrote `no factor` to `results.txt` for work that never ran. A
+  driver reset (Windows TDR) part way through would have done the same. Every blocking
+  call a result depends on is now checked, and a failure stops the run before anything is
+  written:
+  `GPU error -5 reading the factor count - a kernel failed, so nothing since the last
+  checkpoint is valid`. The unchecked reads go back to 0.9. Found when a 1.4 experiment
+  faulted (a misaligned local-memory access) and still printed `RESULT: no factor`.
+- **The diagnostics claimed results.** `--sieve-only`, `--nogpu` and `--noxfer` test
+  nothing; the code said as much, but the run still wrote `no factor` lines to
+  `results.txt`, logged `status=complete` with `tested=0`, and resumed from and then
+  deleted the job's checkpoint. Timing the sieve on a job part way through would have
+  reported it done and thrown its progress away. They now write no result, log
+  `status=diagnostic`, print `RESULT: none`, and leave any checkpoint alone.
+  `--nogpu` and `--noxfer` go back to 0.9, `--sieve-only` to 1.2.
+- **The run header misreported the device sieve's depth.** It printed
+  `capped to 2097152 by segment_size/8` for both sieves. The cap is the CPU sieve's alone;
+  the device sieve applies every prime below `sieve_primes` (5.5 M as shipped, about
+  380 k primes). The bug dates from 1.2. The first 1.4 analysis took the header's figure;
+  the numbers above are for the real depth.
+
+### Verified
+
+- Survivor counts identical to the 1.4 kernel build before the sieve work on 15 jobs:
+  `segment_size` 2^23, 2^24 and 2^25, multi-level ranges, the `2^81` and `2^87` slices, a
+  tiny range, and four slices that contain a known factor (`p` = 103, 137, 163, 191), each
+  found. Also identical with `--no-fuse` (48,156,233,645 tested at `p = 27886007, 2^66`,
+  the same as fused) and `sieve = cpu`. `--selftest` passes.
+- A range that crosses `2^88`, where the kernel changes width mid-range: identical
+  (`p = 999000011`, 96,636,764,160 scanned, 16,821,663,444 tested).
+- Killed with `taskkill /F` at class 468 of 960 of a `2^72` level, then resumed: the
+  totals equal an uninterrupted run's (491,126,599,937 scanned, 85,488,590,422 tested).
+
+### Removed
+
+- `mersenne_tf64`, `mersenne_tf72`, `mersenne_tf72L(x2)`, `mersenne_tf84Lx2`,
+  `mersenne_tf90Lx2` and their fused forms; `arithmetic = 64` and `72` now stop with a
+  message.
+- `sieve_mark_tier` and `sieve_mark_small`.
+
+---
+
 ## 1.3 — 2026-08-11
 
 Two independent things, found in that order.
