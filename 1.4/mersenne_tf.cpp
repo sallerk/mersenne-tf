@@ -1,5 +1,5 @@
 // ===========================================================================
-//  mersenne_tf 1.3  --  GPU trial factoring of Mersenne numbers  M_p = 2^p - 1
+//  mersenne_tf 1.4  --  GPU trial factoring of Mersenne numbers  M_p = 2^p - 1
 // ===========================================================================
 //
 //  Finds every PRIME factor of M_p inside a user-chosen range of candidate
@@ -626,14 +626,16 @@ struct Config {
     U128        factor_max    = u128_shl(u128_from(1), 40);
     int         bit_lo        = 0;      // as written in worktodo, for reporting
     int         bit_hi        = 0;
+    std::string aid;                    // PrimeNet assignment id from Factor=, or empty
     uint32_t    sieve_primes  = 0;          // 0 = auto (resolve_sieve_limit)
     uint32_t    segment_size  = 1u << 22;
     int         threads       = 0;          // 0 = auto
     int         platform      = -1;         // -1 = auto
     int         device        = 0;
     bool        stop_on_factor = false;
-    std::string results_file  = "results.txt";   // GIMPS submission lines only
+    std::string results_file  = "results.txt";   // PrimeNet JSON result lines only
     std::string log_file      = "runlog.txt";    // human record of every run
+    std::string user, computer;                  // optional, copied into results
     int         arithmetic    = 0;      // 0 = auto, 84/90/96/128 to force a width
     int         vector        = 0;      // 96-bit candidates per work item: 0 = auto, 1 or 2
     int         sieve_on_gpu  = 1;      // 1 = sieve on the device, 0 = the CPU sieve
@@ -800,6 +802,9 @@ static bool parse_cfg_bool(const std::string& val, bool& out, std::string& err)
 //         The GIMPS assignment line, as PrimeNet hands it out and as mfaktc
 //         reads it.  Paste an assignment straight in.  The id may be anything
 //         (PrimeNet's 32-hex-digit key, or N/A when you have no assignment).
+//         Only a 32-hex-digit key is an assignment: it goes into every result
+//         line as "aid".  N/A and AutoPrimeNet's 0 mean none, and so does
+//         anything else -- an aid naming no assignment would be a false claim.
 //
 //     exponent   = 9147253
 //     factor_min = 1
@@ -809,6 +814,13 @@ static bool parse_cfg_bool(const std::string& val, bool& out, std::string& err)
 //  Bit levels are the natural unit here -- the search runs one at a time and
 //  reports each as it clears -- so the Factor= form is preferred.
 // ---------------------------------------------------------------------------
+static bool is_assignment_id(const std::string& s)
+{
+    if (s.size() != 32) return false;
+    for (unsigned char c : s) if (!isxdigit(c)) return false;
+    return true;
+}
+
 static bool load_worktodo(const std::string& path, Config& cfg, std::string& err)
 {
     FILE* f = fopen(path.c_str(), "rb");
@@ -863,6 +875,7 @@ static bool load_worktodo(const std::string& path, Config& cfg, std::string& err
             cfg.exponent   = e.lo;
             cfg.bit_lo     = lo;
             cfg.bit_hi     = hi;
+            cfg.aid        = is_assignment_id(parts[0]) ? parts[0] : "";
             cfg.factor_min = (lo == 0) ? u128_from(1) : u128_shl(u128_from(1), (unsigned)lo);
             cfg.factor_max = u128_shl(u128_from(1), (unsigned)hi);
             fclose(f);
@@ -967,6 +980,10 @@ static bool load_config(const std::string& path, Config& cfg, std::string& err)
             cfg.results_file = val;
         } else if (key == "log_file") {
             cfg.log_file = val;
+        } else if (key == "user" || key == "username") {
+            cfg.user = val;
+        } else if (key == "computer" || key == "computer_name") {
+            cfg.computer = val;
         } else if (key == "workgroup") {
             if (!parse_cfg_int(val, 0, 65536, cfg.workgroup, perr)) return fail(key + ": " + perr);
         } else if (key == "gpu_slots") {
@@ -1379,8 +1396,9 @@ static Wheel build_wheel(uint64_t p)
 //  A class is the natural unit: the run is a loop over wheel classes, so after
 //  each phase of classes finishes and the GPU queue has drained, everything
 //  below that class index is provably complete.  Resuming skips those classes.
-//  Factors are already appended to the results file the moment they are found,
-//  so a checkpoint only has to carry them for the end-of-run recap.
+//  A factor goes into results.txt with its bit level's line, when the level
+//  finishes, so until then the checkpoint is what carries it: a resumed run
+//  reports it with the level.
 // ---------------------------------------------------------------------------
 struct CheckpointData {
     uint64_t p = 0, wheel = 0, classes_total = 0, classes_done = 0;
@@ -1469,7 +1487,7 @@ static bool g_noxfer = false;
 static bool g_sieve_only = false;
 
 // Under any of the three diagnostics above nothing is tested, so the run must
-// claim nothing: no "no factor" line, no "complete" record, and no checkpoint
+// claim nothing: no results.txt line, no "complete" record, and no checkpoint
 // read, written or deleted -- else timing the sieve on a live job would report
 // the job done and throw away its real progress.
 static bool diagnostic_run() { return g_nogpu || g_noxfer || g_sieve_only; }
@@ -1665,6 +1683,8 @@ struct RunStats {
     uint64_t gpu_tested  = 0;    // candidates that survived the sieve
     double   seconds     = 0;
     bool     interrupted = false;
+    bool     factors_pending = false;   // stopped inside a level whose factors only
+                                        // the checkpoint holds until it finishes
 };
 
 struct Found { U128 q; };
@@ -1691,13 +1711,249 @@ static void check_small_primes_in_range(uint64_t p, U128 fmin, U128 fmax,
 }
 
 // ---------------------------------------------------------------------------
-//  Announce one factor: full detail to the console the moment the GPU flags it,
-//  plus one line appended to the results file.  Nothing here is taken from the
-//  GPU on trust -- every field is recomputed on the CPU.
+//  results.txt -- PrimeNet's JSON result format, one line per bit level:
+//
+//    {"status":"NF", "exponent":9147253, "worktype":"TF", "bitlo":64, "bithi":65,
+//     "rangecomplete":true, "program":{"name":"mersenne_tf", "version":"1.4"},
+//     "timestamp":"2026-10-03 21:14:07", "os":{...}, "checksum":{...}}
+//
+//  The keys are Prime95's, in Prime95's order, as Mp_p-1_gpu writes them: the
+//  form the PrimeNet manual results page and AutoPrimeNet read.  A level with
+//  factors is "F" with a "factors" list after "worktype".  "user" and
+//  "computer" (config.txt) and "aid" (the worktodo line) appear only when set.
+//  Up to 1.4's first release results.txt held text lines, which PrimeNet no
+//  longer accepts.
+//
+//  "os" and "checksum" are what mfaktc 0.24 and mfakto add to a TF result.
+//  The checksum is a CRC32 over the result's fields, laid out as mfaktc lays
+//  them out (tf_checksum_fields); mfaktc says PrimeNet validates TF results
+//  with it.  It is an integrity check, not a secret -- mfaktc's source has it
+//  -- and the self test reproduces a checksum from a real mfaktc line.
+//  Prime95's "security-code" is a private scheme of its own, so it is not
+//  written, as Mp_p-1_gpu does not write it.
 // ---------------------------------------------------------------------------
-// Identifies the program in GIMPS result lines, as mfaktc's version string does.
-#define TF_PROGRAM_ID MTF_NAME " " MTF_VERSION
+#define MTF_OS "Windows"
+#if defined(_M_X64)
+#  define MTF_ARCH "x86_64"
+#elif defined(_M_ARM64)
+#  define MTF_ARCH "ARM64"
+#elif defined(_M_IX86)
+#  define MTF_ARCH "x86_32"
+#else
+#  define MTF_ARCH ""
+#endif
 
+// CRC-32 as zlib computes it (reflected, polynomial 0xEDB88320) -- mfaktc's
+// crc32_checksum.
+static uint32_t crc32_ieee(const std::string& s)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    for (unsigned char b : s) {
+        c ^= b;
+        for (int i = 0; i < 8; ++i) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+// The string mfaktc 0.24 checksums, field for field:
+//   exponent;TF;factors;;bitlo;bithi;rangecomplete;;;name;version;kernel;details;os;arch;timestamp
+// with the factors comma-separated, rangecomplete 1 or 0, and the empty fields
+// empty in mfaktc too.  mersenne_tf writes no kernel or details, so those are
+// empty here; the self test passes mfaktc's own values to check the layout.
+static std::string tf_checksum_fields(uint64_t p, const std::string& factors_csv, int bitlo,
+                                      int bithi, bool complete, const char* name,
+                                      const char* version, const char* kernel,
+                                      const char* details, const char* os, const char* arch,
+                                      const std::string& stamp)
+{
+    char head[32], tail[512];
+    snprintf(head, sizeof(head), "%llu;TF;", (unsigned long long)p);
+    snprintf(tail, sizeof(tail), ";;%d;%d;%d;;;%s;%s;%s;%s;%s;%s;", bitlo, bithi,
+             complete ? 1 : 0, name, version, kernel, details, os, arch);
+    return head + factors_csv + tail + stamp;
+}
+
+static std::string json_escape(const std::string& s)
+{
+    std::string o;
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') { o += '\\'; o += (char)c; }
+        else if (c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+        else o += (char)c;
+    }
+    return o;
+}
+
+// "YYYY-MM-DD HH:MM:SS" in UTC, as Prime95, mfaktc and Mp_p-1_gpu stamp results.
+static std::string utc_stamp()
+{
+    SYSTEMTIME t; GetSystemTime(&t);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    return buf;
+}
+
+// One result line.  `factors` ascending; none means "NF".  `complete` is
+// rangecomplete: every candidate from 2^bitlo to 2^bithi was tested.
+static std::string tf_result_json(const Config& cfg, uint64_t p, int bitlo, int bithi,
+                                  bool complete, const std::vector<U128>& factors,
+                                  const std::string& stamp)
+{
+    std::string csv, quoted;
+    for (const U128& q : factors) {
+        const std::string d = u128_to_dec(q);
+        if (!csv.empty()) { csv += ","; quoted += ","; }
+        csv += d;
+        quoted += "\"" + d + "\"";
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf), "{\"status\":\"%s\", \"exponent\":%llu, \"worktype\":\"TF\"",
+             factors.empty() ? "NF" : "F", (unsigned long long)p);
+    std::string s = buf;
+    if (!factors.empty()) s += ", \"factors\":[" + quoted + "]";
+    snprintf(buf, sizeof(buf), ", \"bitlo\":%d, \"bithi\":%d, \"rangecomplete\":%s",
+             bitlo, bithi, complete ? "true" : "false");
+    s += buf;
+    s += ", \"program\":{\"name\":\"" MTF_NAME "\", \"version\":\"" MTF_VERSION "\"}";
+    s += ", \"timestamp\":\"" + stamp + "\"";
+    if (!cfg.user.empty())     s += ", \"user\":\"" + json_escape(cfg.user) + "\"";
+    if (!cfg.computer.empty()) s += ", \"computer\":\"" + json_escape(cfg.computer) + "\"";
+    if (!cfg.aid.empty())      s += ", \"aid\":\"" + cfg.aid + "\"";
+    s += ", \"os\":{\"os\":\"" MTF_OS "\", \"architecture\":\"" MTF_ARCH "\"}";
+    const uint32_t ck = crc32_ieee(tf_checksum_fields(p, csv, bitlo, bithi, complete, MTF_NAME,
+                                                      MTF_VERSION, "", "", MTF_OS, MTF_ARCH, stamp));
+    snprintf(buf, sizeof(buf), ", \"checksum\":{\"version\":1, \"checksum\":\"%08X\"}}", ck);
+    return s + buf;
+}
+
+// ---------------------------------------------------------------------------
+//  The lock GIMPS programs share for worktodo.txt and results.txt (mfaktc,
+//  mfakto, CUDALucas, Mp_p-1_gpu, AutoPrimeNet): before touching FILE, create
+//  FILE.lck exclusively; while it exists, someone else is using FILE; delete it
+//  when done.  AutoPrimeNet holds it while it reads results.txt, so an append
+//  made without it could land in the middle of that read.
+//
+//  The lock file is opened delete-on-close, so however this process ends --
+//  Ctrl-C, closing the window, a kill, a crash -- Windows removes it.  Nobody
+//  detects stale locks, so a holder must never die holding one.  A finished
+//  result is never dropped: Ctrl-C while waiting, or a folder where no lock can
+//  be created at all, writes without it.  Ported from Mp_p-1_gpu's FileLock,
+//  without its self-test hooks.
+// ---------------------------------------------------------------------------
+class ResultsLock {
+public:
+    explicit ResultsLock(const std::string& file);
+    ~ResultsLock();
+    ResultsLock(const ResultsLock&) = delete;
+    ResultsLock& operator=(const ResultsLock&) = delete;
+private:
+    HANDLE h_ = INVALID_HANDLE_VALUE;
+};
+
+ResultsLock::ResultsLock(const std::string& file)
+{
+    const std::string lck = file + ".lck";
+    const auto t0 = std::chrono::steady_clock::now();
+    double stop_seen = -1, denied_since = -1;
+    bool said_wait = false, said_stale = false;
+    DWORD sleep_ms = 0;
+    for (;;) {
+        // No FILE_SHARE_DELETE: a `del` of a live lock fails instead of quietly
+        // breaking the exclusion.  DELETE access is for the POSIX delete below.
+        h_ = CreateFileA(lck.c_str(), GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE,
+                         nullptr);
+        if (h_ != INVALID_HANDLE_VALUE) {
+            if (said_wait) printf("  got %s\n", lck.c_str());
+            return;
+        }
+        const DWORD  e = GetLastError();
+        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (e == ERROR_FILE_EXISTS || e == ERROR_ALREADY_EXISTS) {
+            denied_since = -1;                              // someone holds it: wait
+        } else if (e == ERROR_ACCESS_DENIED || e == ERROR_SHARING_VIOLATION ||
+                   e == ERROR_LOCK_VIOLATION) {
+            // Also what a lock file that is being deleted returns, so retry --
+            // but a read-only folder says the same forever.
+            if (denied_since < 0) denied_since = t;
+            if (t - denied_since >= 5.0) {
+                printf("  ! cannot create %s (error %lu) -- writing %s without the lock\n",
+                       lck.c_str(), (unsigned long)e, file.c_str());
+                return;
+            }
+        } else {
+            printf("  ! cannot create %s (error %lu) -- writing %s without the lock\n",
+                   lck.c_str(), (unsigned long)e, file.c_str());
+            return;
+        }
+        if (g_interrupt.load()) {
+            if (stop_seen < 0) stop_seen = t;
+            if (t - stop_seen >= 1.0) {
+                printf("  interrupted while waiting for %s -- writing %s without it\n",
+                       lck.c_str(), file.c_str());
+                return;
+            }
+        }
+        if (!said_wait && t >= 2.0) {
+            printf("  waiting for %s -- another program (AutoPrimeNet?) is using %s\n",
+                   lck.c_str(), file.c_str());
+            said_wait = true;
+        }
+        if (!said_stale && t >= 60.0) {
+            printf("  still waiting for %s.  If no other program is running here, the lock\n"
+                   "  is stale: delete %s\n", lck.c_str(), lck.c_str());
+            said_stale = true;
+        }
+        fflush(stdout);
+        // mfaktc's backoff, 1 ms longer per try up to 1 s; after a Ctrl-C, retry
+        // often through the grace period.
+        sleep_ms = (stop_seen >= 0) ? 20 : std::min<DWORD>(sleep_ms + 1, 1000);
+        for (DWORD slept = 0; slept < sleep_ms; ) {
+            const DWORD slice = std::min<DWORD>(100, sleep_ms - slept);
+            Sleep(slice);
+            slept += slice;
+            if (stop_seen < 0 && g_interrupt.load()) break;
+        }
+    }
+}
+
+ResultsLock::~ResultsLock()
+{
+    if (h_ == INVALID_HANDLE_VALUE) return;
+    // Delete with POSIX semantics first, so the name goes at once even if another
+    // process (an antivirus scanner, say) has the file open.  Delete-on-close
+    // alone would leave it "delete pending" until they close it, and meanwhile
+    // an exclusive create fails with access denied, which AutoPrimeNet treats
+    // as an error rather than as "busy".  Best effort: delete-on-close still
+    // removes it when the handle closes.
+    struct { DWORD flags; } disposition = { 0x1 | 0x2 };   // FILE_DISPOSITION_FLAG_DELETE | _POSIX_SEMANTICS
+    SetFileInformationByHandle(h_, (FILE_INFO_BY_HANDLE_CLASS)21,   // FileDispositionInfoEx
+                               &disposition, sizeof(disposition));
+    CloseHandle(h_);
+}
+
+// Append one line under the lock.  On failure the line goes to the console, so
+// it can still be submitted by hand.
+static bool results_append(const std::string& path, const std::string& line)
+{
+    ResultsLock lock(path);
+    FILE* f = fopen(path.c_str(), "a");
+    bool ok = (f != nullptr);
+    if (ok) {
+        ok = fputs(line.c_str(), f) >= 0 && fputc('\n', f) != EOF;
+        ok = (fclose(f) == 0) && ok;
+    }
+    if (!ok) printf("  ! could not write to %s -- this result is NOT recorded there:\n  %s\n",
+                    path.c_str(), line.c_str());
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+//  Announce one factor: full detail to the console the moment the GPU flags it.
+//  Nothing here is taken from the GPU on trust -- every field is recomputed on
+//  the CPU.  It goes into results.txt with its bit level's line (log_level).
+// ---------------------------------------------------------------------------
 static void report_factor(uint64_t p, U128 q, const Config& cfg)
 {
     bool verified = u128_eq(h_pow2_mod(p, q), u128_from(1));
@@ -1714,19 +1970,10 @@ static void report_factor(uint64_t p, U128 q, const Config& cfg)
     printf("      size      = %d bits\n", u128_bitlen(q));
     printf("      2^p mod q = 1 : %s  (recomputed on the CPU)\n", verified ? "VERIFIED" : "*** FAILED ***");
     printf("      q is      : %s\n", pl);
-
-    // GIMPS manual-submission format.  Paste results.txt straight into
-    // https://www.mersenne.org/manual_result/ -- these are the exact lines that
-    // page parses, so nothing has to be reformatted by hand.
-    FILE* rf = fopen(cfg.results_file.c_str(), "a");
-    if (rf) {
-        fprintf(rf, "M%llu has a factor: %s [TF:%d:%d:%s]\n",
-                (unsigned long long)p, u128_to_dec(q).c_str(),
-                cfg.bit_lo, cfg.bit_hi, TF_PROGRAM_ID);
-        fclose(rf);
-        printf("      logged to : %s\n", cfg.results_file.c_str());
-    }
-    if (!verified) printf("      *** NOT logged as verified -- CPU check failed ***\n");
+    if (verified)
+        printf("      results   : goes into %s with its bit level\n", cfg.results_file.c_str());
+    else
+        printf("      *** NOT reported -- the CPU check failed, so its level claims nothing ***\n");
     printf("\n");
     fflush(stdout);
 }
@@ -1772,9 +2019,9 @@ struct Level {
     U128 qhi_disp;          // what to print as the upper end
     U128 candidates;        // k on the wheel inside this level
     int  bit_lo, bit_hi;    // the level as GIMPS names it: 2^bit_lo .. 2^bit_hi
-    bool full;              // false when the range stops inside this level, in
-                            // which case it is NOT a cleared bit level and must
-                            // not be reported to GIMPS as one
+    bool full;              // false when the range starts or stops inside this
+                            // level, in which case it is NOT a cleared bit level
+                            // and must not be reported to GIMPS as one
 };
 
 static std::vector<Level> build_levels(uint64_t p, const Wheel& wh, U128 fmin, U128 fmax,
@@ -1799,6 +2046,11 @@ static std::vector<Level> build_levels(uint64_t p, const Wheel& wh, U128 fmin, U
         const bool truncated = u128_lt(kmax, ksplit);
         U128 khi = truncated ? kmax : ksplit;
         if (u128_lt(khi, klo)) continue;
+        // The range can start inside a level too (a plain-form factor_min that
+        // is not a power of two): the odd q from 2^bit_lo up to it were never
+        // tested, so that level is not cleared either.  Up to 1.4's first
+        // release only the top end was checked, and such a level was claimed.
+        const bool cut_below = u128_gt(qlo, u128_add(u128_shl(ONE, (unsigned)prev_e), ONE));
 
         Level L;
         L.klo = klo; L.khi = khi;
@@ -1808,7 +2060,7 @@ static std::vector<Level> build_levels(uint64_t p, const Wheel& wh, U128 fmin, U
         L.candidates = wheel_k_count(wh, klo, khi);
         L.bit_lo = prev_e;
         L.bit_hi = e;
-        L.full   = !truncated;
+        L.full   = !truncated && !cut_below;
         if (!u128_is_zero(L.candidates)) out.push_back(L);   // empty level: nothing to scan
 
         klo = u128_add(khi, ONE);
@@ -1828,31 +2080,53 @@ static std::string level_label(const Level& L)
     return u128_to_pow2(L.qlo) + ".." + u128_to_pow2(L.qhi_disp);
 }
 
-// One line per level, appended the moment that level is finished -- so a run
-// stopped later keeps every level it did clear.
+// The factors that lie inside one level, ascending.
+static std::vector<U128> level_factors(const Level& L, const std::vector<U128>& factors)
+{
+    std::vector<U128> in;
+    for (const U128& q : factors)
+        if (u128_ge(q, L.qlo) && u128_lt(q, L.qhi_excl)) in.push_back(q);
+    std::sort(in.begin(), in.end(), [](const U128& a, const U128& b) { return u128_lt(a, b); });
+    return in;
+}
+
+// The results.txt line for one level, if it has one.  `scanned_all`: every
+// class of the level was run.  Then it is "NF" if it is a whole GIMPS level,
+// and "F" with all its factors, rangecomplete true, if it is a whole level that
+// found some.  A partly covered level is "F", rangecomplete false, if it found
+// factors, and gets no line if it did not -- a partial clean level claims
+// nothing.  As in mfaktc, a level's factors are reported together, once.
+static bool write_level_result(const Config& cfg, uint64_t p, const Level& L,
+                               bool scanned_all, const std::vector<U128>& factors)
+{
+    if (diagnostic_run()) return false;
+    const bool complete = scanned_all && L.full;
+    const std::vector<U128> in = level_factors(L, factors);
+    if (in.empty() && !complete) return false;
+    // A GPU hit the CPU cannot confirm means a device error: the level claims
+    // nothing, neither the hit nor "no factor".
+    for (const U128& q : in)
+        if (!u128_eq(h_pow2_mod(p, q), u128_from(1))) {
+            printf("  ! %s failed the CPU check, so level %s claims nothing in %s\n",
+                   u128_to_dec(q).c_str(), level_label(L).c_str(), cfg.results_file.c_str());
+            return false;
+        }
+    return results_append(cfg.results_file,
+                          tf_result_json(cfg, p, L.bit_lo, L.bit_hi, complete, in, utc_stamp()));
+}
+
+// Announced, and written to results.txt, the moment the level is finished -- so
+// a run stopped later keeps every level it did clear.
 static void log_level(const Config& cfg, uint64_t p, const Level& L,
                       const std::vector<U128>& factors)
 {
-    int nf = 0;
-    for (const U128& q : factors)
-        if (u128_ge(q, L.qlo) && u128_lt(q, L.qhi_excl)) ++nf;
-
+    const size_t nf = level_factors(L, factors).size();
     clear_line();
     printf("  level %s %s: %s candidates, %d factor(s)\n", level_label(L).c_str(),
            diagnostic_run() ? "scanned (diagnostic)" : "cleared",
-           u128_to_dec(L.candidates).c_str(), nf);
+           u128_to_dec(L.candidates).c_str(), (int)nf);
     fflush(stdout);
-
-    // One GIMPS "no factor" line per bit level, written as the level clears.
-    // A level that found something is covered by its "has a factor" line, so it
-    // is not also reported clean.
-    if (nf == 0 && L.full && !diagnostic_run()) {
-        FILE* rf = fopen(cfg.results_file.c_str(), "a");
-        if (!rf) { printf("  ! could not write to %s\n", cfg.results_file.c_str()); return; }
-        fprintf(rf, "no factor for M%llu from 2^%d to 2^%d [%s]\n",
-                (unsigned long long)p, L.bit_lo, L.bit_hi, TF_PROGRAM_ID);
-        fclose(rf);
-    }
+    write_level_result(cfg, p, L, true, factors);
 }
 
 // ---------------------------------------------------------------------------
@@ -2262,6 +2536,12 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
 
     auto last_cp = std::chrono::steady_clock::now();
     const char* last_knm = nullptr;         // so the width is announced on change
+
+    // Where and why the run stopped short of the end of the range, for the
+    // results line of the level it stopped inside (after the level loop).
+    size_t stop_li = levels.size();         // the level it stopped inside, if any
+    bool   stopped_on_factor = false;       // stop_on_factor, not Ctrl-C or an error
+    bool   cp_at_interrupt   = false;       // an interrupt checkpoint carries the factors
 
     struct ClassInfo { U128 kc0; uint64_t N; uint64_t seg0; };
 
@@ -2858,7 +3138,8 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                 if ((launches % 64) == 0) {
                     uint32_t cnt = drain_hits();          // announces new hits at once
                     if (!err.empty()) { request_abort(); break; }
-                    if ((cnt && cfg.stop_on_factor) || g_interrupt.load()) request_abort();
+                    if (cnt && cfg.stop_on_factor) { stopped_on_factor = true; request_abort(); }
+                    if (g_interrupt.load()) request_abort();
                 }
             }
             // The phase's last segment: its TF launch was held for a next
@@ -2930,6 +3211,7 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     cp.factors    = factors;
                     checkpoint_save(cp_path, cp);
+                    cp_at_interrupt = true;
                     printf("  checkpoint written to %s (level %s, %llu of %llu classes done)\n"
                            "  re-run with the same config.txt to continue.\n",
                            cp_path.c_str(), lvl.c_str(),
@@ -2941,7 +3223,7 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
         }   // end of the class-phase loop
 
         // ---- level finished: every class of it is drained and complete -----
-        if (abort_flag.load() || !err.empty()) break;
+        if (abort_flag.load() || !err.empty()) { stop_li = li; break; }
         if (verbose) log_level(cfg, p, L, factors);
         if (use_cp) {
             CheckpointData cp;
@@ -2991,8 +3273,28 @@ static bool run_range(Gpu& g, const Config& cfg, uint64_t p, U128 fmin, U128 fma
                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     stats.interrupted = g_interrupt.load();
 
-    // The whole range is done -- drop the checkpoint so the next run starts clean.
-    if (use_cp && err.empty() && !abort_flag.load())
+    // ---- stopped inside a level: report what it found ----------------------
+    //  Its factors go into results.txt now, rangecomplete false -- unless the
+    //  interrupt checkpoint carries them, in which case the resumed run reports
+    //  them with the whole level, once.  stop_on_factor ends the job, so its
+    //  checkpoint is dropped below: a resume would report them a second time.
+    if (verbose && err.empty() && stop_li < levels.size()) {
+        const Level& L = levels[stop_li];
+        if (stopped_on_factor || !cp_at_interrupt) {
+            if (write_level_result(cfg, p, L, false, factors))
+                printf("  stopped inside level %s: its factors went into %s, marked not complete\n",
+                       level_label(L).c_str(), cfg.results_file.c_str());
+        } else if (!level_factors(L, factors).empty()) {
+            stats.factors_pending = true;
+            printf("  the factors found in level %s are in %s and go into\n"
+                   "  %s when that level finishes -- re-run to finish it.\n",
+                   level_label(L).c_str(), cp_path.c_str(), cfg.results_file.c_str());
+        }
+    }
+
+    // The whole range is done, or stop_on_factor ended the job -- drop the
+    // checkpoint so the next run starts clean.
+    if (use_cp && err.empty() && (!abort_flag.load() || stopped_on_factor))
         remove(cp_path.c_str());
 
     return err.empty();
@@ -3114,6 +3416,43 @@ struct TestCase {
     const char* expected;    // space separated
 };
 
+// The results.txt format, checked without the GPU: CRC32 and the checksum's
+// field layout against two real mfaktc 0.24.1 lines, and two whole lines
+// against copies built independently (in Python, from the format rather than
+// from this code; for the x86_64 build).
+static int results_format_selftest()
+{
+    int fails = 0;
+    auto check = [&](bool ok, const char* what) {
+        printf("  [%s] results.txt: %s\n", ok ? " ok " : "FAIL", what);
+        if (!ok) ++fails;
+    };
+    check(crc32_ieee("123456789") == 0xCBF43926u, "CRC32 check value");
+    check(crc32_ieee(tf_checksum_fields(82589933, "", 30, 70, true, "mfaktc", "0.24.1",
+                                        "75bit_mul32_gs", "CUDA 12.8 arch 8.6", "Windows",
+                                        "x86_64", "2026-07-26 02:33:30")) == 0x63C9832Du,
+          "checksum layout reproduces a real mfaktc NF line");
+    check(crc32_ieee(tf_checksum_fields(48205429, "504325198199,2176310738837111", 1, 70, true,
+                                        "mfaktc", "0.24.1", "75bit_mul32_gs",
+                                        "CUDA 12.8 arch 8.6", "Windows", "x86_64",
+                                        "2026-07-26 02:40:08")) == 0x8723FB66u,
+          "checksum layout reproduces a real mfaktc F line");
+    Config c;
+    check(tf_result_json(c, 9147253, 64, 65, true, {}, "2026-10-03 12:00:00") ==
+          R"({"status":"NF", "exponent":9147253, "worktype":"TF", "bitlo":64, "bithi":65, "rangecomplete":true, "program":{"name":"mersenne_tf", "version":"1.4"}, "timestamp":"2026-10-03 12:00:00", "os":{"os":"Windows", "architecture":"x86_64"}, "checksum":{"version":1, "checksum":"E085B525"}})",
+          "NF line, byte for byte");
+    c.user = "ab\"c\\d"; c.computer = "pc1"; c.aid = "0123456789ABCDEF0123456789abcdef";
+    check(tf_result_json(c, 350377, 38, 40, false,
+                         { u128_from(348318885503ull), u128_from(348319587257ull) },
+                         "2026-10-03 12:00:01") ==
+          R"({"status":"F", "exponent":350377, "worktype":"TF", "factors":["348318885503","348319587257"], "bitlo":38, "bithi":40, "rangecomplete":false, "program":{"name":"mersenne_tf", "version":"1.4"}, "timestamp":"2026-10-03 12:00:01", "user":"ab\"c\\d", "computer":"pc1", "aid":"0123456789ABCDEF0123456789abcdef", "os":{"os":"Windows", "architecture":"x86_64"}, "checksum":{"version":1, "checksum":"8976DB46"}})",
+          "F line with user, computer and aid, byte for byte");
+    check(is_assignment_id("0123456789ABCDEF0123456789abcdef") && !is_assignment_id("N/A") &&
+          !is_assignment_id("0") && !is_assignment_id("0123456789ABCDEF0123456789ABCDEG"),
+          "only a 32-hex-digit id is an aid");
+    return fails;
+}
+
 static bool selftest(Gpu& g, Config cfg)
 {
     // Known factorisations, with at least one factor in every arithmetic band.
@@ -3147,7 +3486,7 @@ static bool selftest(Gpu& g, Config cfg)
 
     cfg.stop_on_factor = false;
     cfg.checkpoint     = false;
-    int fails = 0;
+    int fails = results_format_selftest();
 
     // Run every case through EVERY kernel that can represent it.  Left to itself
     // the auto rule would send each case down one path and leave the others
@@ -3397,8 +3736,8 @@ static int run_main(int argc, char** argv)
         printf("\n");
     }
 
-    // Each factor was already announced in full (and logged) the moment it was
-    // found; this is just the recap.
+    // Each factor was already announced in full the moment it was found, and
+    // written to results.txt with its level; this is just the recap.
     if (factors.empty()) {
         // An interrupted run cleared only part of the range, so it cannot claim
         // the range is clean -- and neither does the record written below.
@@ -3409,8 +3748,10 @@ static int run_main(int argc, char** argv)
                    : "  RESULT: no factor of M_%llu in the range.\n",
                (unsigned long long)p);
     } else {
-        printf("  RESULT: %d factor(s) of M_%llu found, logged to %s:\n",
-               (int)factors.size(), (unsigned long long)p, cfg.results_file.c_str());
+        const bool reported = !diagnostic_run() && !stats.factors_pending;
+        printf("  RESULT: %d factor(s) of M_%llu found%s%s:\n",
+               (int)factors.size(), (unsigned long long)p,
+               reported ? ", reported in " : "", reported ? cfg.results_file.c_str() : "");
         for (const U128& q : factors)
             printf("          %s  (%d bits)\n", u128_to_dec(q).c_str(), u128_bitlen(q));
     }

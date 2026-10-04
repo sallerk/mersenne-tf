@@ -6,8 +6,8 @@ with **exact integer arithmetic** — no floating point anywhere in the number t
 `M_p` itself is never constructed. It has `p` bits, and `p` may be in the hundreds of
 millions; the program only ever works modulo the candidate, which is at most 128 bits.
 
-Results are written in the format the GIMPS manual submission page expects, so finished
-work can be pasted straight back.
+Results are written as PrimeNet JSON result lines, the format the GIMPS manual results
+page and AutoPrimeNet read, so finished work can be submitted as it is.
 
 > Measurements, and the reasoning behind every default, are in
 > [`CHANGELOG.md`](../CHANGELOG.md). This file is the manual.
@@ -43,6 +43,10 @@ rounds):
 ours from one session to the next, so take the margin as a few percent. Details in the
 changelog.
 
+*`results.txt` is now in PrimeNet's JSON result format*, one line per bit level, with the
+keys Prime95 writes and the checksum mfaktc adds — PrimeNet no longer accepts the text lines
+earlier versions wrote. See [§5](#5-output).
+
 `arithmetic = 64` and `72` are gone — the new 28-bit kernel beats both everywhere they
 applied. Full list, with the measurements, in [`CHANGELOG.md`](../CHANGELOG.md).
 
@@ -76,7 +80,8 @@ Factor=N/A,9147253,64,65
 ```
 
 That is the PrimeNet assignment line: trial factor `M_9147253` from `2^64` to `2^65`. Paste
-an assignment in as-is; the id may be PrimeNet's 32-hex-digit key or `N/A`.
+an assignment in as-is; the id may be PrimeNet's 32-hex-digit key or `N/A`. A key is
+copied into every result line as `"aid"`; `N/A` means no assignment and adds nothing.
 
 ```ini
 exponent   = 9147253      # for a range that is not a whole bit level
@@ -147,22 +152,37 @@ least important fields rather than spilling onto a second line.
 
 ### `results.txt` — for GIMPS
 
-Only lines the [manual submission page](https://www.mersenne.org/manual_result/) parses:
+PrimeNet result lines and nothing else: one JSON line per bit level, in the format the
+[manual results page](https://www.mersenne.org/manual_result/) and AutoPrimeNet read.
 
 ```
-M350377 has a factor: 348318885503 [TF:38:39:mersenne_tf 1.4]
-no factor for M9147253 from 2^64 to 2^65 [mersenne_tf 1.4]
+{"status":"NF", "exponent":9147253, "worktype":"TF", "bitlo":62, "bithi":63, "rangecomplete":true, "program":{"name":"mersenne_tf", "version":"1.4"}, "timestamp":"2026-10-03 22:49:17", "os":{"os":"Windows", "architecture":"x86_64"}, "checksum":{"version":1, "checksum":"D3C07086"}}
+{"status":"F", "exponent":48205429, "worktype":"TF", "factors":["2176310738837111"], "bitlo":50, "bithi":60, "rangecomplete":true, "program":{"name":"mersenne_tf", "version":"1.4"}, "timestamp":"2026-10-03 22:49:11", "os":{"os":"Windows", "architecture":"x86_64"}, "checksum":{"version":1, "checksum":"024C35F3"}}
 ```
 
-A `no factor` line is written **as each bit level clears**, so a run stopped part way still
-submits everything it finished. A level your range only partly covers is deliberately *not*
-reported — that claim belongs to whoever finishes it.
+- **One line per bit level, written as the level finishes:** `"NF"` if it found nothing,
+  `"F"` with every factor it found otherwise. A run stopped part way still submits
+  everything it finished.
+- **`rangecomplete`** says whether every candidate in the level was tested. A level your
+  range only partly covers is not claimed: it gets a line only if it found a factor, and
+  then with `"rangecomplete":false`. The same goes for the level `stop_on_factor` stops in.
+- The keys are Prime95's, in Prime95's order. `"aid"` is there when the worktodo line has
+  a PrimeNet assignment key, and `"user"`/`"computer"` when `config.txt` sets them.
+- `"os"` and `"checksum"` are what mfaktc 0.24 adds to a TF result: a CRC32 over the
+  result's fields, which mfaktc says PrimeNet uses to validate TF results. The self test
+  checks the layout against real mfaktc lines.
+- The file is written under `results.txt.lck`, the lock AutoPrimeNet and mfaktc use, so
+  AutoPrimeNet can read it while a run is going.
 
 Above `2^60` a level is one bit. Below it the levels are decades — `<2^40`, `2^40..2^50`,
 `2^50..2^60` — so a job like `Factor=N/A,9147253,58,59` is scanned in full but counts as
-part of the `2^50..2^60` level and produces no `no factor` line. Ask for `50,60` if you
-want that range claimed. This only ever withholds a true claim, never makes a false one,
-and GIMPS assignments do not reach that far down.
+part of the `2^50..2^60` level and produces no `NF` line. Ask for `50,60` if you want that
+range claimed. This only ever withholds a true claim, never makes a false one, and GIMPS
+assignments do not reach that far down.
+
+**AutoPrimeNet** submits only result lines from programs it knows, by name, and
+`mersenne_tf` is not on its list yet (AutoPrimeNet 2.0.1). Until it is, submit
+`results.txt` on the [manual results page](https://www.mersenne.org/manual_result/).
 
 ### `runlog.txt` — for you
 
@@ -204,12 +224,17 @@ Re-run with the same files and it resumes:
 
 A checkpoint is only accepted if the exponent and both bounds still match, so editing the
 job starts a clean run rather than silently skipping work — and it says so rather than
-restarting in silence. Factors are appended to `results.txt` the instant they are found,
-so they survive even an unclean kill.
+restarting in silence.
+
+A factor goes into `results.txt` with its level's line, when the level finishes. Until
+then the checkpoint carries it, so a run stopped or killed part way through a level
+reports it when resumed — once, with the whole level. With `checkpoint = 0` there is
+nothing to resume, so Ctrl-C writes the level's factors at once, marked
+`"rangecomplete":false`.
 
 If the GPU fails part way through (a kernel fault, or a driver reset), the run stops with
-`ERROR: GPU error ...` and claims nothing since its last checkpoint: no `no factor` line,
-no `complete` in the run log. Re-run to resume from that checkpoint.
+`ERROR: GPU error ...` and claims nothing since its last checkpoint: no `results.txt`
+line, no `complete` in the run log. Re-run to resume from that checkpoint.
 
 ## 7. Settings reference
 
@@ -225,8 +250,9 @@ The ones worth knowing:
 | `arithmetic` | `auto` picks the narrowest exact kernel per bit level — three 28-bit limbs below `2^80`, 30-bit to `2^88`, 32-bit to `2^96`, else 64-bit; force `84`/`90`/`96`/`128` to compare |
 | `threads` | CPU sieve threads, `0` = auto (cores − 1) |
 | `platform`, `device` | which GPU (see `--list-devices`), `-1` = auto |
-| `stop_on_factor` | `1` to stop at the first factor instead of scanning the whole range |
+| `stop_on_factor` | `1` to stop at the first factor instead of scanning the whole range; the job ends there and keeps no checkpoint |
 | `results_file`, `log_file` | the two output files above |
+| `user`, `computer` | optional; copied into every result line. Neither the manual results page nor AutoPrimeNet needs them |
 | `checkpoint`, `checkpoint_seconds` | progress saving, on by default |
 | `segment_size`, `workgroup`, `gpu_slots` | tuning; the defaults were measured, leave them alone unless benchmarking |
 
@@ -258,7 +284,7 @@ more candidates than at `p = 9.1M`.
 | `mersenne_tf.exe` | the program; self-contained apart from the driver |
 | `worktodo.txt` | the job |
 | `config.txt` | machine settings |
-| `results.txt` | GIMPS submission lines |
+| `results.txt` | PrimeNet result lines (JSON) |
 | `runlog.txt` | run history |
 | `checkpoint_<p>.txt` | progress for an unfinished run; deleted when it completes |
 | `mersenne_tf.cpp`, `tf_kernel.cl.h` | host source and OpenCL kernels |

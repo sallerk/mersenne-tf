@@ -164,6 +164,45 @@ that to take seconds. Checked to fail: compiling the kernels for `p + 2` fails e
 in the 28/30-bit modes whose factor the GPU has to find (the tiny ones below the sieve
 bound are tested on the CPU and still pass).
 
+### `results.txt` in PrimeNet's JSON format
+
+PrimeNet no longer accepts the text lines `results.txt` held up to now (`no factor for
+M... from 2^64 to 2^65 [...]`), so it now gets one JSON line per bit level, in the format
+Prime95 writes and the manual results page and AutoPrimeNet read:
+
+```
+{"status":"NF", "exponent":9147253, "worktype":"TF", "bitlo":40, "bithi":50, "rangecomplete":true, "program":{"name":"mersenne_tf", "version":"1.4"}, "timestamp":"2026-10-03 22:49:06", "user":"tester", "computer":"box1", "aid":"0123456789ABCDEF0123456789ABCDEF", "os":{"os":"Windows", "architecture":"x86_64"}, "checksum":{"version":1, "checksum":"959D3328"}}
+```
+
+- Keys in Prime95's order, as Mp_p-1_gpu writes them; `"factors"` after `"worktype"` on
+  an `F` line. `"aid"` comes from a `Factor=` line's 32-hex-digit key (`N/A` and `0` mean
+  none); `"user"` and `"computer"` from two new, optional `config.txt` keys. Timestamps are
+  UTC.
+- `"os"` and `"checksum"` as mfaktc 0.24 writes them: CRC32 over
+  `exponent;TF;factors;;bitlo;bithi;rangecomplete;;;name;version;kernel;details;os;arch;timestamp`.
+  That layout was confirmed against all seven mfaktc 0.24.1 result lines on this machine,
+  and the self test now checks two of them. Prime95's `security-code` is a private scheme
+  and is not written, as Mp_p-1_gpu does not write it.
+- **A level's factors are reported with the level, once**, as mfaktc does: `F` with all of
+  them and `"rangecomplete":true` when the level finishes, where the text format wrote
+  each factor the moment it was found, labelled with the whole job's range. A run stopped
+  inside a level is covered by the checkpoint, which carries its factors, and the resumed
+  run reports them. Without a checkpoint (`checkpoint = 0`), or when `stop_on_factor`
+  ends the job, the level's factors are written at once with `"rangecomplete":false`.
+  `stop_on_factor` now also deletes the checkpoint: a resume would report the same factor
+  twice.
+- Written under `results.txt.lck`, the lock file AutoPrimeNet, mfaktc and Mp_p-1_gpu use,
+  with Mp_p-1_gpu's handling: wait while another program holds it, and on Ctrl-C, or where
+  no lock can be created, write anyway rather than drop a result.
+- Only CPU-verified factors are reported. A GPU hit the CPU check rejects makes its level
+  claim nothing. Before, it was logged anyway, with a console note saying it was not.
+- The diagnostics now write nothing at all. Before, a factor small enough to be found by
+  the CPU check (below `sieve_primes`) still went into `results.txt`.
+
+AutoPrimeNet (2.0.1) submits only lines from programs on a list in its source, and
+`mersenne_tf` is not on it, so for now `results.txt` goes in through the manual results
+page.
+
 ### Fixed
 
 - **A GPU fault could report a level as cleared.** The reads that bring back the factor
@@ -188,6 +227,11 @@ bound are tested on the CPU and still pass).
   the device sieve applies every prime below `sieve_primes` (5.5 M as shipped, about
   380 k primes). The bug dates from 1.2. The first 1.4 analysis took the header's figure;
   the numbers above are for the real depth.
+- **A range that started inside a level claimed the whole level.** Only the top end of a
+  level was checked for being cut short. A plain-form job from `2^61+2^59` to `2^63`
+  wrote `no factor ... from 2^61 to 2^62` although nothing below `2^61+2^59` was tested.
+  Such a level now claims nothing, like one the range stops inside. `Factor=` lines start
+  on a power of two and were never affected.
 
 ### Verified
 
@@ -200,6 +244,15 @@ bound are tested on the CPU and still pass).
   (`p = 999000011`, 96,636,764,160 scanned, 16,821,663,444 tested).
 - Killed with `taskkill /F` at class 468 of 960 of a `2^72` level, then resumed: the
   totals equal an uninterrupted run's (491,126,599,937 scanned, 85,488,590,422 tested).
+- JSON results: every line written in testing parses, has the keys in Prime95's order, and
+  carries a checksum recomputed independently in Python; every factor checks with
+  Python's `pow`. `Factor=N/A,48205429,1,64` gives `F` for `<2^40` and `2^50..2^60` with
+  the two factors mfaktc found to `2^70`, and `NF` for the other five levels. A factor
+  found early in a level (`M101`, 341117531003194129, class 78 of 960) is reported exactly
+  once after each way of stopping: Ctrl-Break with a checkpoint and then resume,
+  Ctrl-Break with `checkpoint = 0`, and a kill before or after the first checkpoint save,
+  each followed by a re-run. With another process holding `results.txt.lck` for 6 s the run
+  waited and then wrote; Ctrl-Break while waiting wrote the line without the lock.
 
 ### Removed
 

@@ -209,16 +209,25 @@ device       = 0
 
 # ---------------------------------------------------------------------------
 #  OUTPUT.
-#    stop_on_factor  1 = stop as soon as a factor is found, 0 = scan it all
-#    results_file    GIMPS manual-submission lines, and nothing else, so the
-#                    file can be pasted straight into
-#                    https://www.mersenne.org/manual_result/ :
-#                        M9147253 has a factor: 313603386094415369 [TF:64:65:...]
-#                        no factor for M9147253 from 2^64 to 2^65 [...]
-#                    A "no factor" line is written as each bit level clears, so
-#                    a run stopped part way still submits what it finished.  A
-#                    level the range only partly covers is NOT reported -- that
-#                    claim belongs to whoever finishes it.
+#    stop_on_factor  1 = stop as soon as a factor is found, 0 = scan it all.
+#                    Stopping ends the job: the factor is reported at once, its
+#                    level as not complete, and no checkpoint is kept.
+#    results_file    PrimeNet result lines and nothing else: one JSON line per
+#                    bit level, in the format Prime95 writes, for
+#                    https://www.mersenne.org/manual_result/ or AutoPrimeNet:
+#                        {"status":"NF", "exponent":9147253, "worktype":"TF",
+#                         "bitlo":64, "bithi":65, "rangecomplete":true, ...}
+#                    A level's line is written as the level finishes -- "NF", or
+#                    "F" with every factor it found -- so a run stopped part way
+#                    still submits what it finished.  A level the range only
+#                    partly covers is NOT claimed: it gets a line only if it
+#                    found a factor, marked "rangecomplete":false.
+#                    Written under results.txt.lck, the lock AutoPrimeNet and
+#                    mfaktc use, so AutoPrimeNet can share the file.
+#    user            optional: your PrimeNet user ID and a name for this
+#    computer        machine, written into every result line.  Not needed for
+#                    the manual results page (it knows who you are) or for
+#                    AutoPrimeNet (it adds its own).
 #    log_file        the human record: one line per run including interrupted
 #                    ones, with status, candidate counts and timings.  This is
 #                    the file to read when you want to know what happened; it is
@@ -234,3 +243,5 @@ stop_on_factor = 0
 results_file   = results.txt
 log_file       = runlog.txt
 pause_on_exit  = auto
+# user         = your_primenet_id
+# computer     = this_machine
