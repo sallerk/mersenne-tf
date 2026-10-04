@@ -231,7 +231,7 @@ page.
   level was checked for being cut short. A plain-form job from `2^61+2^59` to `2^63`
   wrote `no factor ... from 2^61 to 2^62` although nothing below `2^61+2^59` was tested.
   Such a level now claims nothing, like one the range stops inside. `Factor=` lines start
-  on a power of two and were never affected.
+  on a power of two and were never affected. The bug dates from 1.0.
 
 ### Verified
 
