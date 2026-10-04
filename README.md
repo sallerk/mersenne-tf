@@ -4,8 +4,8 @@ GPU trial factoring of Mersenne numbers, `M_p = 2^p - 1`, with exact integer ari
 
 `M_p` is never constructed. It has `p` bits, and `p` may be in the hundreds of millions;
 the program only ever works modulo the candidate, which is at most 128 bits. Results are
-written in the format the [GIMPS manual submission page](https://www.mersenne.org/manual_result/)
-expects.
+written as PrimeNet JSON result lines, ready for the
+[GIMPS manual results page](https://www.mersenne.org/manual_result/).
 
 ## Performance
 
@@ -26,29 +26,19 @@ what was tried and dropped, is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Download
 
-Each version has its own release, with a **prebuilt 64-bit Windows binary** inside — you do
-not need Visual Studio, a CUDA Toolkit or an OpenCL SDK to run it. The only requirement is
-`OpenCL.dll`, which ships with your GPU driver.
+[**mersenne_tf-1.4-win64.zip**](https://github.com/sallerk/mersenne-tf/releases/download/v1.4/mersenne_tf-1.4-win64.zip)
+— a **prebuilt 64-bit Windows binary** plus its source. You do not need Visual Studio, a
+CUDA Toolkit or an OpenCL SDK to run it; the only requirement is `OpenCL.dll`, which ships
+with your GPU driver. The manual is [1.4/README.md](1.4/README.md), and what changed in
+each version is in [CHANGELOG.md](CHANGELOG.md).
 
-| version | download | |
-|---|---|---|
-| **1.4** | [**mersenne_tf-1.4-win64.zip**](https://github.com/sallerk/mersenne-tf/releases/download/v1.4/mersenne_tf-1.4-win64.zip) | current. A trial-factoring kernel compiled for each exponent, and a device sieve whose largest primes are struck inside that kernel: a few percent ahead of mfaktc on the same card (table above). Also stops a GPU fault from being reported as "no factor". Start here — see [1.4/README.md](1.4/README.md). |
-| 1.3 | [mersenne_tf-1.3-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.3/mersenne_tf-1.3-win64.zip) | a device sieve that pays to run deep, and 28-/30-bit limbs that removed a 21% cliff above `2^72`. **1.18x** over 1.2 at `2^66`, **1.39x** at `2^76`. Kept as-is. |
-| 1.2 | [mersenne_tf-1.2-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.2/mersenne_tf-1.2-win64.zip) | moved the sieve to the GPU — the whole pipeline is device-side. Kept as-is. |
-| 1.1 | [mersenne_tf-1.1-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.1/mersenne_tf-1.1-win64.zip) | reports the sieve bound it actually applies, not the one you asked for. Kept as-is. |
-| 1.0 | [mersenne_tf-1.0-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v1.0/mersenne_tf-1.0-win64.zip) | job moved to `worktodo.txt`; results in GIMPS manual-submission format. Kept as-is. |
-| 0.9 | [mersenne_tf-0.9-win64.zip](https://github.com/sallerk/mersenne-tf/releases/download/v0.9/mersenne_tf-0.9-win64.zip) | job and settings both in `config.txt`; results in its own format. Kept as-is. |
-
-All of them are on the [releases page](https://github.com/sallerk/mersenne-tf/releases).
-GitHub's green *Code → Download ZIP* button gives you the **whole repository**, every
-version at once — the links above are the way to get one version on its own.
-
-Each release is also its own directory in this repository, kept exactly as it shipped.
-What changed between them is in [CHANGELOG.md](CHANGELOG.md).
+GitHub's green *Code → Download ZIP* button gives you the whole repository instead, with
+every earlier version in its own directory — the link above is the way to get 1.4 on its
+own.
 
 ## Quick start
 
-Unzip a release and run it:
+Unzip it and run:
 
 ```bash
 mersenne_tf.exe --selftest
@@ -56,7 +46,6 @@ mersenne_tf.exe
 ```
 
 Edit `worktodo.txt` to say what to factor, `config.txt` to say which GPU to use.
-(In 0.9 both live in `config.txt`.)
 
 Or build from source — Visual Studio 2019/2022 with "Desktop development with C++",
 nothing else:
@@ -101,17 +90,24 @@ least important fields rather than spilling onto a second one.
 
 ## Results
 
-`results.txt` gets only lines the [manual submission page](https://www.mersenne.org/manual_result/)
-parses:
+`results.txt` gets PrimeNet result lines and nothing else: one JSON line per bit level, in
+the format Prime95 writes, for the [manual results page](https://www.mersenne.org/manual_result/):
 
 ```
-M350377 has a factor: 348318885503 [TF:38:39:mersenne_tf 1.4]
-no factor for M9147253 from 2^64 to 2^65 [mersenne_tf 1.4]
+{"status":"NF", "exponent":9147253, "worktype":"TF", "bitlo":62, "bithi":63, "rangecomplete":true, "program":{"name":"mersenne_tf", "version":"1.4"}, "timestamp":"2026-10-03 22:49:17", "os":{"os":"Windows", "architecture":"x86_64"}, "checksum":{"version":1, "checksum":"D3C07086"}}
+{"status":"F", "exponent":48205429, "worktype":"TF", "factors":["2176310738837111"], "bitlo":50, "bithi":60, "rangecomplete":true, "program":{"name":"mersenne_tf", "version":"1.4"}, "timestamp":"2026-10-03 22:49:11", "os":{"os":"Windows", "architecture":"x86_64"}, "checksum":{"version":1, "checksum":"024C35F3"}}
 ```
 
-A `no factor` line is written **as each bit level clears**, so a run stopped part way still
-submits everything it finished. A level your range only partly covers is deliberately *not*
-reported — that claim belongs to whoever finishes it.
+A level's line is written **as the level finishes**: `NF`, or `F` with every factor it
+found. A run stopped part way still submits everything it finished. A level your range
+only partly covers is deliberately *not* claimed — it gets a line only if it found a
+factor, marked `"rangecomplete":false`.
+
+The lines carry the checksum mfaktc 0.24 adds to TF results, the PrimeNet assignment key
+from `worktodo.txt` when there is one, and optionally your user and computer names. The
+file is written under `results.txt.lck`, the lock AutoPrimeNet uses, but AutoPrimeNet does
+not list `mersenne_tf` among the programs whose results it submits yet, so for now submit
+`results.txt` by hand.
 
 Every factor is re-verified on the CPU, by a separate implementation, before it is written.
 `runlog.txt` gets one human-readable line per run including interrupted ones; it is kept
@@ -127,8 +123,9 @@ Re-run with the same files and it resumes at the level and class it reached:
 ```
 
 A checkpoint is accepted only if the exponent and both bounds still match, so editing the
-job starts a clean run rather than silently skipping work — and it says so. Factors are
-appended to `results.txt` the instant they are found, so they survive even an unclean kill.
+job starts a clean run rather than silently skipping work — and it says so. A factor found
+in a level that has not finished is kept in the checkpoint, so a run that is stopped or
+killed reports it, with its level, when resumed.
 
 ## Scope and limitations
 
@@ -138,7 +135,8 @@ appended to `results.txt` the instant they are found, so they survive even an un
   C++ and the kernels are plain OpenCL 1.2, but the build script and the OpenCL loader are
   Windows-only as written.
 - **One job per run.** The first entry in `worktodo.txt` wins; there is no queue and no
-  PrimeNet automation. Results are written for you to upload manually.
+  PrimeNet automation. Results are written for you to upload manually, and a finished job
+  stays in `worktodo.txt`.
 - **The exponent must be prime**, and below `2^62`. For composite `n` the factors of
   `2^n - 1` do not all have the form `2kn+1`, so the search would be unsound — the program
   refuses rather than silently returning a wrong "no factor".
